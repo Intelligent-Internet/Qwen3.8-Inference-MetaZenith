@@ -159,6 +159,18 @@ class FlashInferCutlassNvFp4LinearKernel(NvFp4LinearKernel):
                 padded_n=x.shape[-1] + weights_padding_bytes * 2,
             )
 
+        # The vocabulary projection is executed once by the target and once
+        # per MTP draft step.  On SM120, B12x is bitwise-identical to CUTLASS
+        # for this layout and wins through M=512; CUTLASS retakes the lead for
+        # larger prompt-logprob matrices.  Keep every other NVFP4 layer on its
+        # autotuned CUTLASS path.
+        use_b12x_lm_head = (
+            output_size == 248320
+            and x_fp4.shape[1] == 2560
+            and x_fp4.shape[0] <= 512
+            and current_platform.has_device_capability(120)
+            and has_flashinfer_b12x_gemm()
+        )
         out = flashinfer_scaled_fp4_mm(
             x_fp4,
             layer.weight,
@@ -166,7 +178,7 @@ class FlashInferCutlassNvFp4LinearKernel(NvFp4LinearKernel):
             layer.weight_scale,
             layer.alpha,
             output_dtype,
-            backend="cutlass",
+            backend="b12x" if use_b12x_lm_head else "cutlass",
         )
 
         out = slice_nvfp4_output(out, output_size)

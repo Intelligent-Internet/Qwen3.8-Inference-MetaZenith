@@ -178,6 +178,122 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_a += HV
 
 
+@triton.jit(do_not_specialize=["N", "T"])
+def fused_sigmoid_gating_delta_rule_update_packed_kernel(
+    A_log,
+    a,
+    b,
+    dt_bias,
+    beta,
+    threshold,
+    mixed_qkv,
+    o,
+    h0,
+    ht,
+    cu_seqlens,
+    ssm_state_indices,
+    num_accepted_tokens,
+    scale,
+    N: tl.int64,
+    T: tl.int64,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    stride_mixed_token: tl.constexpr,
+    stride_init_state_token: tl.constexpr,
+    stride_final_state_token: tl.constexpr,
+    stride_indices_seq: tl.constexpr,
+    stride_indices_tok: tl.constexpr,
+):
+    """Speculative update over packed token-major ``[q, k, v]`` input.
+
+    Keep the arithmetic and state-snapshot order identical to
+    ``fused_sigmoid_gating_delta_rule_update_kernel``.  Only the q/k/v
+    addresses differ, avoiding three contiguous copies and their cat kernel.
+    """
+    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+    all_tokens = T
+    seq_tokens = eos - bos
+
+    if seq_tokens == 0:
+        return
+
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    q_offset = i_h * K + o_k
+    k_offset = H * K + i_h * K + o_k
+    v_offset = 2 * H * K + i_hv * V + o_v
+    p_mixed = mixed_qkv + bos * stride_mixed_token
+    p_A_log = A_log + i_hv
+    p_a = a + bos * HV + i_hv
+    p_dt_bias = dt_bias + i_hv
+    p_b = b + bos * HV + i_hv
+    p_o = o + ((i_k * all_tokens + bos) * HV + i_hv) * V + o_v
+
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_v[:, None] & mask_k[None, :]
+
+    b_h = tl.zeros([BV, BK], dtype=tl.float32)
+    i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+    state_idx = tl.load(
+        ssm_state_indices
+        + i_n * stride_indices_seq
+        + i_t * stride_indices_tok
+    ).to(tl.int64)
+    if state_idx <= 0:
+        return
+    p_h0 = h0 + state_idx * stride_init_state_token
+    p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+    b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+
+    for i_t in range(0, seq_tokens):
+        b_q = tl.load(p_mixed + q_offset, mask=mask_k, other=0).to(tl.float32)
+        b_k = tl.load(p_mixed + k_offset, mask=mask_k, other=0).to(tl.float32)
+        b_v = tl.load(p_mixed + v_offset, mask=mask_v, other=0).to(tl.float32)
+        b_b = tl.load(p_b).to(tl.float32)
+
+        # Preserve the reference expression sequence exactly.
+        x = tl.load(p_a).to(tl.float32) + tl.load(p_dt_bias).to(tl.float32)
+        softplus_x = tl.where(
+            beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
+        )
+        b_g = -tl.exp(tl.load(p_A_log).to(tl.float32)) * softplus_x
+        b_beta = tl.sigmoid(b_b.to(tl.float32))
+
+        b_q = b_q * (tl.rsqrt(tl.sum(b_q * b_q) + 1e-6))
+        b_k = b_k * (tl.rsqrt(tl.sum(b_k * b_k) + 1e-6))
+        b_q = b_q * scale
+        b_h *= tl.exp(b_g)
+        b_v -= tl.sum(b_h * b_k[None, :], 1)
+        b_v *= b_beta
+        b_h += b_v[:, None] * b_k[None, :]
+        b_o = tl.sum(b_h * b_q[None, :], 1)
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+        final_state_idx = tl.load(
+            ssm_state_indices
+            + i_n * stride_indices_seq
+            + i_t * stride_indices_tok
+        ).to(tl.int64)
+        if final_state_idx > 0:
+            p_ht = ht + final_state_idx * stride_final_state_token
+            p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+            tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+
+        p_mixed += stride_mixed_token
+        p_o += HV * V
+        p_b += HV
+        p_a += HV
+
+
 def fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -277,3 +393,83 @@ def fused_sigmoid_gating_delta_rule_update(
     )
     o = o.squeeze(0)
     return o, final_state
+
+
+def fused_sigmoid_gating_delta_rule_update_packed(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    mixed_qkv: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    beta: float = 1.0,
+    threshold: float = 20.0,
+    scale: float | None = None,
+):
+    """Bitwise-equivalent speculative GDN update from packed q/k/v input."""
+    if mixed_qkv.ndim != 2 or mixed_qkv.stride(-1) != 1:
+        raise ValueError("`mixed_qkv` must be a token-major contiguous 2D tensor")
+    if initial_state.ndim != 4:
+        raise ValueError("`initial_state` must have shape [slots, HV, V, K]")
+    if ssm_state_indices.ndim != 2:
+        raise ValueError("speculative `ssm_state_indices` must be two-dimensional")
+
+    mixed_qkv = mixed_qkv.contiguous()
+    T = mixed_qkv.shape[0]
+    HV, V, K = initial_state.shape[-3:]
+    qk_dim = mixed_qkv.shape[-1] - HV * V
+    if qk_dim <= 0 or qk_dim % (2 * K) != 0:
+        raise ValueError("packed q/k width is inconsistent with recurrent state")
+    H = qk_dim // (2 * K)
+    if H <= 0 or HV % H != 0:
+        raise ValueError("packed q/k head count is inconsistent with value heads")
+    if a.shape[-1] != HV or b.shape[-1] != HV:
+        raise ValueError("a/b head count is inconsistent with recurrent state")
+
+    N = cu_seqlens.numel() - 1
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
+    assert NK == 1, "NK > 1 is not supported yet"
+    if scale is None:
+        scale = K**-0.5
+    else:
+        assert scale > 0, "scale must be positive"
+
+    output = mixed_qkv.new_empty(1, T, HV, V)
+    stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
+    grid = (NK, NV, N * HV)
+    fused_sigmoid_gating_delta_rule_update_packed_kernel[grid](
+        A_log=A_log,
+        a=a.contiguous(),
+        b=b.contiguous(),
+        dt_bias=dt_bias,
+        beta=beta,
+        threshold=threshold,
+        mixed_qkv=mixed_qkv,
+        o=output,
+        h0=initial_state,
+        ht=initial_state,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=ssm_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        scale=scale,
+        N=N,
+        T=T,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        BV=BV,
+        stride_mixed_token=mixed_qkv.stride(0),
+        stride_init_state_token=initial_state.stride(0),
+        stride_final_state_token=initial_state.stride(0),
+        stride_indices_seq=stride_indices_seq,
+        stride_indices_tok=stride_indices_tok,
+        num_warps=4,
+        num_stages=3,
+    )
+    return output, initial_state

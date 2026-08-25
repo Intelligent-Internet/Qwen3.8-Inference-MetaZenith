@@ -53,6 +53,9 @@ from vllm.third_party.flash_linear_attention.ops import (
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_sigmoid_gating_delta_rule_update,
 )
+from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
+    fused_sigmoid_gating_delta_rule_update_packed,
+)
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
@@ -1309,8 +1312,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
-
         # Split mixed non-spec-decode+prefill to process independently
         split_non_spec = (
             spec_sequence_masks is None
@@ -1373,24 +1374,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            assert mixed_qkv_spec is not None
             core_attn_out_spec, last_recurrent_state = (
-                fused_sigmoid_gating_delta_rule_update(
+                fused_sigmoid_gating_delta_rule_update_packed(
                     A_log=self.A_log,
                     a=a,
                     b=b,
                     dt_bias=self.dt_bias,
-                    q=query_spec,
-                    k=key_spec,
-                    v=value_spec,
+                    mixed_qkv=mixed_qkv_spec,
                     initial_state=ssm_state,
-                    inplace_final_state=True,
                     cu_seqlens=spec_query_start_loc[  # type: ignore[index]
                         : attn_metadata.num_spec_decodes
                         + 1  # type: ignore[attr-defined]
                     ],
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=num_accepted_tokens,
-                    use_qk_l2norm_in_kernel=True,
                 )
             )
         else:

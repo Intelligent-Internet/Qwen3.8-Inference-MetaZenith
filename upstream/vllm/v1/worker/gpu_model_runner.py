@@ -144,6 +144,10 @@ from vllm.v1.attention.backends.linear_attn import (
     BailingLinearAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.turboquant_attn import (
+    TURBOQUANT_FULL_CUDAGRAPH_MAX_SEQ_LENS,
+    TurboQuantAttentionBackend,
+)
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     create_fast_prefill_custom_backend,
@@ -861,6 +865,7 @@ class GPUModelRunner(
 
         # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
+        self.full_cudagraph_max_seq_len_buckets: tuple[int, ...] | None = None
 
         self.mm_budget = (
             MultiModalBudget(self.vllm_config, self.mm_registry)
@@ -2292,6 +2297,7 @@ class GPUModelRunner(
         logits_indices: torch.Tensor | None = None,
         use_spec_decode: bool = False,
         for_cudagraph_capture: bool = False,
+        cudagraph_capture_max_seq_len: int | None = None,
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
@@ -2316,7 +2322,11 @@ class GPUModelRunner(
             # For some attention backends (e.g. FA) with sliding window models we need
             # to make sure the backend see a max_seq_len that is larger to the sliding
             # window size when capturing to make sure the correct kernel is selected.
-            max_seq_len = self.max_model_len
+            max_seq_len = (
+                cudagraph_capture_max_seq_len
+                if cudagraph_capture_max_seq_len is not None
+                else self.max_model_len
+            )
         else:
             max_seq_len = self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max().item()
 
@@ -3938,7 +3948,7 @@ class GPUModelRunner(
         use_cascade_attn: bool,
         allow_microbatching: bool = True,
         force_eager: bool = False,
-        disable_full_cudagraph: bool = False,
+        full_cudagraph_max_seq_len: int | None = None,
         # For cudagraph capture TODO(lucas): Refactor how we capture cudagraphs (will
         # be improved in model runner v2)
         force_uniform_decode: bool | None = None,
@@ -3981,10 +3991,9 @@ class GPUModelRunner(
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
                 num_active_loras=num_active_loras,
+                full_cudagraph_max_seq_len=full_cudagraph_max_seq_len,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
-                invalid_modes={CUDAGraphMode.FULL}
-                if disable_full or disable_full_cudagraph
-                else None,
+                invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
@@ -4250,6 +4259,16 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            full_cudagraph_max_seq_len = None
+            if self.full_cudagraph_max_seq_len_buckets is not None:
+                short_bucket, long_bucket = self.full_cudagraph_max_seq_len_buckets
+                max_seq_len = int(
+                    self.optimistic_seq_lens_cpu[:num_reqs].max()
+                )
+                full_cudagraph_max_seq_len = (
+                    short_bucket if max_seq_len < long_bucket else long_bucket
+                )
+
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
@@ -4277,13 +4296,7 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
-                # TurboQuant decode changes its reduction tile at this general
-                # context regime boundary. Keep the long-context R003 path;
-                # the captured FULL graphs contain the short-context tile.
-                disable_full_cudagraph=int(
-                    self.optimistic_seq_lens_cpu[:num_reqs].max()
-                )
-                >= 8192,
+                full_cudagraph_max_seq_len=full_cudagraph_max_seq_len,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
@@ -5851,6 +5864,7 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        full_cudagraph_max_seq_len: int | None = None,
         randomize_inputs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -5964,6 +5978,7 @@ class GPUModelRunner(
                 # `force_num_active_loras` is used for cudagraph capture; because we
                 # need to capture graphs for specific num_active_loras counts
                 force_num_active_loras=num_active_loras,
+                full_cudagraph_max_seq_len=full_cudagraph_max_seq_len,
             )
         )
 
@@ -6088,6 +6103,7 @@ class GPUModelRunner(
                         is_graph_capturing
                         or cudagraph_runtime_mode == CUDAGraphMode.FULL
                     ),
+                    cudagraph_capture_max_seq_len=full_cudagraph_max_seq_len,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
                 )
@@ -6952,6 +6968,7 @@ class GPUModelRunner(
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
+                full_cudagraph_max_seq_len=desc.max_seq_len,
             )
         if num_warmups > 0:
             # Warmups may use auxiliary streams. Ensure all of their work has
@@ -6973,6 +6990,7 @@ class GPUModelRunner(
                 num_active_loras=desc.num_active_loras,
                 is_graph_capturing=True,
                 profile_seq_lens=profile_seq_lens,
+                full_cudagraph_max_seq_len=desc.max_seq_len,
             )
 
     def _capture_cudagraphs(
@@ -7210,6 +7228,18 @@ class GPUModelRunner(
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
             cudagraph_mode, self.uniform_decode_query_len
         )
+        if any(
+            TurboQuantAttentionBackend in attn_backend_set
+            for attn_backend_set in attention_backends
+        ):
+            self.full_cudagraph_max_seq_len_buckets = (
+                TURBOQUANT_FULL_CUDAGRAPH_MAX_SEQ_LENS
+            )
+            self.cudagraph_dispatcher.specialize_full_cudagraphs_by_max_seq_len(
+                self.full_cudagraph_max_seq_len_buckets
+            )
+        else:
+            self.full_cudagraph_max_seq_len_buckets = None
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
         if self.speculative_config and (

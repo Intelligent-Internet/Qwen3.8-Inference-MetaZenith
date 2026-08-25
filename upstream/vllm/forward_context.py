@@ -44,6 +44,12 @@ class BatchDescriptor:
     """
     True if all the requests in the batch have the same number of tokens.
     """
+    max_seq_len: int | None = None
+    """
+    Compile-time maximum-sequence bucket for FULL cudagraphs. Backends whose
+    captured kernel changes by context regime can use this to keep distinct
+    graph variants. None for unspecialized FULL and all PIECEWISE graphs.
+    """
     has_lora: bool = False
     """
     Whether this batch has active LoRA adapters.

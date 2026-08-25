@@ -70,6 +70,14 @@ if _HAS_FLASH_ATTN:
 # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
 _CONTINUATION_DECODE_THRESHOLD = 128
 
+# The decode reduction tile changes here. FULL cudagraphs must be captured on
+# both sides because this Python-side choice becomes fixed in the graph.
+TURBOQUANT_DECODE_TILE_CONTEXT_THRESHOLD = 8192
+TURBOQUANT_FULL_CUDAGRAPH_MAX_SEQ_LENS = (
+    TURBOQUANT_DECODE_TILE_CONTEXT_THRESHOLD - 1,
+    TURBOQUANT_DECODE_TILE_CONTEXT_THRESHOLD,
+)
+
 
 def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
     """Orthonormal Hadamard matrix (Sylvester construction), cached per (d, device).
@@ -251,10 +259,6 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         # Set seq_lens to 1 so CUDA graph capture is fast
         # (real seq_lens are filled at replay time).
         attn_metadata.seq_lens.fill_(1)
-        # Full-graph capture otherwise sees max_model_len and permanently
-        # selects the long-context decode tile. Runtime dispatch keeps these
-        # graphs below the existing 8192-token TurboQuant regime boundary.
-        attn_metadata.max_seq_len = 8191
         return attn_metadata
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
@@ -782,7 +786,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         key_fp8=self.tq_config.key_fp8,
                         norm_correction=self.tq_config.norm_correction,
                         PiT=PiT,
-                        block_kv=4 if seq_len < 8192 else 2,
+                        block_kv=4
+                        if seq_len < TURBOQUANT_DECODE_TILE_CONTEXT_THRESHOLD
+                        else 2,
                     )
                 else:
                     # Large continuation: dequant cached K/V and use
@@ -996,6 +1002,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             lse_buf=lse_buf,
             buf_holder=layer,
             max_num_kv_splits=self.max_num_kv_splits,
-            block_kv=4 if attn_metadata.max_seq_len < 8192 else 2,
+            block_kv=4
+            if attn_metadata.max_seq_len
+            < TURBOQUANT_DECODE_TILE_CONTEXT_THRESHOLD
+            else 2,
         )
         return result

@@ -163,6 +163,21 @@ class CudagraphDispatcher:
         )
         self.cudagraph_keys[runtime_mode].add(batch_descriptor)
 
+    def specialize_full_cudagraphs_by_max_seq_len(
+        self, max_seq_lens: tuple[int, ...]
+    ) -> None:
+        """Duplicate uniform FULL keys for compile-time context regimes."""
+        assert self.keys_initialized
+        assert max_seq_lens and all(value > 0 for value in max_seq_lens)
+        assert len(max_seq_lens) == len(set(max_seq_lens))
+        full_keys = self.cudagraph_keys[CUDAGraphMode.FULL]
+        assert all(key.max_seq_len is None for key in full_keys)
+        self.cudagraph_keys[CUDAGraphMode.FULL] = {
+            replace(key, max_seq_len=max_seq_len)
+            for key in full_keys
+            for max_seq_len in max_seq_lens
+        }
+
     def initialize_cudagraph_keys(
         self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1
     ):
@@ -238,6 +253,7 @@ class CudagraphDispatcher:
         uniform_decode: bool = False,
         has_lora: bool = False,
         num_active_loras: int = 0,
+        full_cudagraph_max_seq_len: int | None = None,
         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
@@ -253,6 +269,8 @@ class CudagraphDispatcher:
                 length is uniform_decode_query_len).
             has_lora: Whether LoRA is active.
             num_active_loras: Number of distinct active LoRA adapters.
+            full_cudagraph_max_seq_len: Compile-time context bucket for a
+                specialized FULL graph. None for unspecialized graphs.
             valid_modes: Set of cudagraph modes that are allowed. None means
                 all modes are allowed.
             invalid_modes: Set of cudagraph modes to exclude. Subtracted from
@@ -306,14 +324,18 @@ class CudagraphDispatcher:
 
         if CUDAGraphMode.FULL in allowed_modes:
             # check if key exists for full cudagraph
-            batch_desc_to_check = batch_desc
+            batch_desc_to_check = replace(
+                batch_desc, max_seq_len=full_cudagraph_max_seq_len
+            )
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.FULL]:
                 return CUDAGraphMode.FULL, batch_desc_to_check
 
         if CUDAGraphMode.PIECEWISE in allowed_modes:
             # also check if the relaxed key exists for more "general"
             # piecewise cudagraph
-            batch_desc_to_check = replace(batch_desc, num_reqs=None, uniform=False)
+            batch_desc_to_check = replace(
+                batch_desc, num_reqs=None, uniform=False, max_seq_len=None
+            )
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
                 return CUDAGraphMode.PIECEWISE, batch_desc_to_check
 
@@ -340,9 +362,14 @@ class CudagraphDispatcher:
         for mode in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]:
             descs = list(self.cudagraph_keys[mode])
             if descs:
-                # Sort by (num_tokens, num_active_loras) descending
+                # Sort largest context variants first so they establish the
+                # shared graph-pool high-water mark before smaller variants.
                 descs.sort(
-                    key=lambda d: (d.num_tokens, d.num_active_loras),
+                    key=lambda d: (
+                        d.num_tokens,
+                        d.num_active_loras,
+                        d.max_seq_len or 0,
+                    ),
                     reverse=True,
                 )
                 result.append((mode, descs))

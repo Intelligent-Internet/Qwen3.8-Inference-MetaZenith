@@ -503,6 +503,7 @@ def triton_turboquant_decode_attention(
     lse_buf: torch.Tensor | None = None,
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
+    block_kv: int = 2,
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -549,7 +550,7 @@ def triton_turboquant_decode_attention(
 
     # Stage 1: split-KV tiled attention scoring + value accumulation
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
-    BLOCK_KV = 2
+    BLOCK_KV = block_kv
     grid = (B, Hq, NUM_KV_SPLITS)
     _tq_decode_stage1[grid](
         q_rot,

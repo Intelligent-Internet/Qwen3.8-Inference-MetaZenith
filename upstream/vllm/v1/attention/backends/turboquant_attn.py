@@ -778,6 +778,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         key_fp8=self.tq_config.key_fp8,
                         norm_correction=self.tq_config.norm_correction,
                         PiT=PiT,
+                        block_kv=4 if seq_len < 8192 else 2,
                     )
                 else:
                     # Large continuation: dequant cached K/V and use
@@ -991,5 +992,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             lse_buf=lse_buf,
             buf_holder=layer,
             max_num_kv_splits=self.max_num_kv_splits,
+            block_kv=4 if attn_metadata.max_seq_len < 8192 else 2,
         )
         return result

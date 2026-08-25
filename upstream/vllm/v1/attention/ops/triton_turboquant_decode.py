@@ -64,6 +64,7 @@ def _tq_decode_stage1(
     stride_mid_h,
     stride_mid_s,  # mid_o strides
     # Constexpr dims
+    NUM_QUERY_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,  # KV cache block_size (pages)
@@ -80,15 +81,19 @@ def _tq_decode_stage1(
     # Block tile sizes
     BLOCK_D: tl.constexpr,  # next_power_of_2(HEAD_DIM)
     BLOCK_KV: tl.constexpr,  # tokens per tile (16)
+    HEAD_GROUP: tl.constexpr,  # query heads sharing one KV head/load
     KEY_FP8: tl.constexpr,  # 1 if K is stored as FP8
     NORM_CORRECTION: tl.constexpr = 0,  # 1 = re-normalize centroids
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
 ):
     bid = tl.program_id(0)  # batch index
-    hid = tl.program_id(1)  # q_head index
+    hgid = tl.program_id(1)  # query-head group index
     sid = tl.program_id(2)  # kv_split index
 
-    kv_head = hid // KV_GROUP_SIZE
+    head_local = tl.arange(0, 8)
+    head_offs = hgid * HEAD_GROUP + head_local
+    head_mask = (head_local < HEAD_GROUP) & (head_offs < NUM_QUERY_HEADS)
+    kv_head = (hgid * HEAD_GROUP) // KV_GROUP_SIZE
 
     # Sequence length for this batch
     seq_len = tl.load(Seq_lens_ptr + bid)
@@ -107,8 +112,16 @@ def _tq_decode_stage1(
     kv_range = tl.arange(0, BLOCK_KV)
 
     # Load query vector: q_rot — [BLOCK_D] float32
-    q_base = bid * stride_qb + hid * stride_qh
-    q_rot = tl.load(Q_rot_ptr + q_base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
+    q_addrs = (
+        bid * stride_qb
+        + head_offs[:, None] * stride_qh
+        + d_offs[None, :]
+    )
+    q_rot = tl.load(
+        Q_rot_ptr + q_addrs,
+        mask=head_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
 
     # Precompute byte/bit index vectors for MSE gather loads
     if not KEY_FP8:
@@ -124,9 +137,9 @@ def _tq_decode_stage1(
         val_bit_shift = val_bit_off % 8
 
     # Online softmax accumulators
-    m_prev = -float("inf")
-    l_prev = 0.0
-    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    m_prev = tl.full([8], -float("inf"), dtype=tl.float32)
+    l_prev = tl.zeros([8], dtype=tl.float32)
+    acc = tl.zeros([8, BLOCK_D], dtype=tl.float32)
 
     bt_base = bid * stride_bt_b
 
@@ -167,12 +180,16 @@ def _tq_decode_stage1(
                 k_float = k_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
             scores = (
                 tl.sum(
-                    tl.where(d_mask[None, :], q_rot[None, :] * k_float, 0.0),
-                    axis=1,
+                    tl.where(
+                        d_mask[None, None, :],
+                        q_rot[:, None, :] * k_float[None, :, :],
+                        0.0,
+                    ),
+                    axis=2,
                 )
                 * ATTN_SCALE
             )
-            scores = tl.where(kv_mask, scores, -float("inf"))
+            scores = tl.where(kv_mask[None, :], scores, -float("inf"))
         else:
             # MSE unpack + norms
             mse_addrs0 = slot_bases[:, None] + mse_byte_idx[None, :]
@@ -206,8 +223,12 @@ def _tq_decode_stage1(
                 c_vals = c_vals * c_inv_norm[:, None]
 
             term1 = tl.sum(
-                tl.where(d_mask[None, :], q_rot[None, :] * c_vals, 0.0),
-                axis=1,
+                tl.where(
+                    d_mask[None, None, :],
+                    q_rot[:, None, :] * c_vals[None, :, :],
+                    0.0,
+                ),
+                axis=2,
             )
 
             # Load norms (fp16 -> fp32): norms are at MSE_BYTES offset
@@ -220,15 +241,15 @@ def _tq_decode_stage1(
             )
             vec_norms = (n_lo | (n_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
 
-            scores = vec_norms * term1 * ATTN_SCALE
-            scores = tl.where(kv_mask, scores, -float("inf"))
+            scores = vec_norms[None, :] * term1 * ATTN_SCALE
+            scores = tl.where(kv_mask[None, :], scores, -float("inf"))
 
         # ============================================================
         # ONLINE SOFTMAX UPDATE (block-level)
         # ============================================================
-        n_e_max = tl.maximum(tl.max(scores, 0), m_prev)
+        n_e_max = tl.maximum(tl.max(scores, 1), m_prev)
         re_scale = tl.exp(m_prev - n_e_max)
-        p = tl.exp(scores - n_e_max)
+        p = tl.exp(scores - n_e_max[:, None])
 
         # ============================================================
         # VALUE LOAD + DEQUANTIZE: [BLOCK_KV, BLOCK_D]
@@ -301,16 +322,29 @@ def _tq_decode_stage1(
         # ============================================================
         # WEIGHTED VALUE ACCUMULATION
         # ============================================================
-        acc = acc * re_scale + tl.sum(p[:, None] * values, 0)
-        l_prev = l_prev * re_scale + tl.sum(p, 0)
+        acc = acc * re_scale[:, None] + tl.sum(
+            p[:, :, None] * values[None, :, :], 1
+        )
+        l_prev = l_prev * re_scale + tl.sum(p, 1)
         m_prev = n_e_max
 
     # Store partial result
-    out_base = bid * stride_mid_b + hid * stride_mid_h + sid * stride_mid_s
+    out_base = (
+        bid * stride_mid_b
+        + head_offs[:, None] * stride_mid_h
+        + sid * stride_mid_s
+    )
     safe_l = tl.where(l_prev > 0.0, l_prev, 1.0)
-    tl.store(Mid_o_ptr + out_base + d_offs, acc / safe_l, mask=d_mask)
+    tl.store(
+        Mid_o_ptr + out_base + d_offs[None, :],
+        acc / safe_l[:, None],
+        mask=head_mask[:, None] & d_mask[None, :],
+    )
     lse = m_prev + tl.log(safe_l)
-    tl.store(Mid_o_ptr + out_base + HEAD_DIM, lse)
+    lse_base = (
+        bid * stride_mid_b + head_offs * stride_mid_h + sid * stride_mid_s
+    )
+    tl.store(Mid_o_ptr + lse_base + HEAD_DIM, lse, mask=head_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +585,8 @@ def triton_turboquant_decode_attention(
     # Stage 1: split-KV tiled attention scoring + value accumulation
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
     BLOCK_KV = block_kv
-    grid = (B, Hq, NUM_KV_SPLITS)
+    HEAD_GROUP = 6 if kv_group_size % 6 == 0 else 1
+    grid = (B, triton.cdiv(Hq, HEAD_GROUP), NUM_KV_SPLITS)
     _tq_decode_stage1[grid](
         q_rot,
         kv_cache,
@@ -568,6 +603,7 @@ def triton_turboquant_decode_attention(
         mid_o.stride(0),
         mid_o.stride(1),
         mid_o.stride(2),
+        NUM_QUERY_HEADS=Hq,
         NUM_KV_HEADS=Hk,
         HEAD_DIM=D,
         BLOCK_SIZE=block_size,
@@ -581,6 +617,7 @@ def triton_turboquant_decode_attention(
         ATTN_SCALE=scale,
         BLOCK_D=cfg["BLOCK_D"],
         BLOCK_KV=BLOCK_KV,
+        HEAD_GROUP=HEAD_GROUP,
         KEY_FP8=1 if key_fp8 else 0,
         NORM_CORRECTION=1 if norm_correction else 0,
         FP8_E4B15=fp8_e4b15,

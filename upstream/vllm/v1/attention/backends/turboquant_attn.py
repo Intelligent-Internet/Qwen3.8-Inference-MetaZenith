@@ -251,6 +251,10 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         # Set seq_lens to 1 so CUDA graph capture is fast
         # (real seq_lens are filled at replay time).
         attn_metadata.seq_lens.fill_(1)
+        # Full-graph capture otherwise sees max_model_len and permanently
+        # selects the long-context decode tile. Runtime dispatch keeps these
+        # graphs below the existing 8192-token TurboQuant regime boundary.
+        attn_metadata.max_seq_len = 8191
         return attn_metadata
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):

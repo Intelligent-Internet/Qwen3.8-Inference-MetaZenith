@@ -3938,6 +3938,7 @@ class GPUModelRunner(
         use_cascade_attn: bool,
         allow_microbatching: bool = True,
         force_eager: bool = False,
+        disable_full_cudagraph: bool = False,
         # For cudagraph capture TODO(lucas): Refactor how we capture cudagraphs (will
         # be improved in model runner v2)
         force_uniform_decode: bool | None = None,
@@ -3981,7 +3982,9 @@ class GPUModelRunner(
                 uniform_decode=uniform_decode,
                 num_active_loras=num_active_loras,
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
-                invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                invalid_modes={CUDAGraphMode.FULL}
+                if disable_full or disable_full_cudagraph
+                else None,
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
@@ -4274,6 +4277,13 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                # TurboQuant decode changes its reduction tile at this general
+                # context regime boundary. Keep the long-context R003 path;
+                # the captured FULL graphs contain the short-context tile.
+                disable_full_cudagraph=int(
+                    self.optimistic_seq_lens_cpu[:num_reqs].max()
+                )
+                >= 8192,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 

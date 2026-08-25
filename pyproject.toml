@@ -1,0 +1,15 @@
+[project]
+name = "qwen38-r000-vllm-baseline"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "vllm",
+    "flashinfer-python>=0.6.13",
+    "nvidia-cutlass-dsl>=4.5.2",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+vllm = { path = "upstream", editable = true }

@@ -146,6 +146,10 @@ from vllm.v1.attention.backends.linear_attn import (
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.turboquant_attn import (
     TURBOQUANT_FULL_CUDAGRAPH_MAX_SEQ_LENS,
+    TURBOQUANT_SPEC_DECODE_NUM_SPLITS,
+    TURBOQUANT_SPEC_NUM_KV_HEADS,
+    TURBOQUANT_SPEC_PAIR_MIN_KV_BYTES,
+    TURBOQUANT_SPEC_SLOT_SIZE_BYTES,
     TurboQuantAttentionBackend,
 )
 from vllm.v1.attention.backends.utils import (
@@ -3939,6 +3943,62 @@ class GPUModelRunner(
             else force_uniform_decode
         )
 
+    def _can_use_tq_spec_decode_shared_graph(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        num_scheduled_tokens: np.ndarray,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        """Conservatively select an exact shared-row TurboQuant graph.
+
+        Async MTP CPU lengths optimistically include all drafts from the prior
+        iteration. The authoritative GPU length can therefore be lower by at
+        most K. Select sharing only if every corrected K+1-row interval keeps
+        one common 32-way split length; false results retain the R035 graph.
+        """
+        query_len = self.uniform_decode_query_len
+        if (
+            self.full_cudagraph_max_seq_len_buckets is None
+            or query_len != 4
+            or self.num_spec_tokens != 3
+            or num_reqs not in (2, 3, 4)
+            or num_tokens != num_reqs * query_len
+            or spec_decode_metadata is None
+            or any(
+                draft_count != self.num_spec_tokens
+                for draft_count in spec_decode_metadata.num_draft_tokens
+            )
+            or np.any(num_scheduled_tokens != query_len)
+        ):
+            return False
+
+        upper_bounds = self.optimistic_seq_lens_cpu[:num_reqs].numpy()
+        for upper_bound_raw in upper_bounds:
+            upper_bound = int(upper_bound_raw)
+            for correction in range(self.num_spec_tokens + 1):
+                actual_end = upper_bound - correction
+                first_row = actual_end - self.num_spec_tokens
+                if cdiv(first_row, TURBOQUANT_SPEC_DECODE_NUM_SPLITS) != cdiv(
+                    actual_end, TURBOQUANT_SPEC_DECODE_NUM_SPLITS
+                ):
+                    return False
+
+        if num_reqs == 2:
+            min_unique_tokens = sum(
+                max(int(value) - self.num_spec_tokens, 0)
+                for value in upper_bounds
+            )
+            min_unique_kv_bytes = (
+                min_unique_tokens
+                * TURBOQUANT_SPEC_NUM_KV_HEADS
+                * TURBOQUANT_SPEC_SLOT_SIZE_BYTES
+            )
+            if min_unique_kv_bytes < TURBOQUANT_SPEC_PAIR_MIN_KV_BYTES:
+                return False
+
+        return True
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -3949,6 +4009,7 @@ class GPUModelRunner(
         allow_microbatching: bool = True,
         force_eager: bool = False,
         full_cudagraph_max_seq_len: int | None = None,
+        full_cudagraph_tq_spec_decode_shared: bool = False,
         # For cudagraph capture TODO(lucas): Refactor how we capture cudagraphs (will
         # be improved in model runner v2)
         force_uniform_decode: bool | None = None,
@@ -3992,6 +4053,9 @@ class GPUModelRunner(
                 uniform_decode=uniform_decode,
                 num_active_loras=num_active_loras,
                 full_cudagraph_max_seq_len=full_cudagraph_max_seq_len,
+                full_cudagraph_tq_spec_decode_shared=(
+                    full_cudagraph_tq_spec_decode_shared
+                ),
                 valid_modes={CUDAGraphMode.NONE} if force_eager else valid_modes,
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
             )
@@ -4277,6 +4341,15 @@ class GPUModelRunner(
                 num_scheduled_tokens_np,
             )
 
+            full_cudagraph_tq_spec_decode_shared = (
+                self._can_use_tq_spec_decode_shared_graph(
+                    num_reqs,
+                    num_tokens_unpadded,
+                    num_scheduled_tokens_np,
+                    spec_decode_metadata,
+                )
+            )
+
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
             if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
@@ -4300,6 +4373,9 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 full_cudagraph_max_seq_len=full_cudagraph_max_seq_len,
+                full_cudagraph_tq_spec_decode_shared=(
+                    full_cudagraph_tq_spec_decode_shared
+                ),
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
@@ -5868,6 +5944,7 @@ class GPUModelRunner(
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         full_cudagraph_max_seq_len: int | None = None,
+        full_cudagraph_tq_spec_decode_shared: bool = False,
         randomize_inputs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -5982,6 +6059,9 @@ class GPUModelRunner(
                 # need to capture graphs for specific num_active_loras counts
                 force_num_active_loras=num_active_loras,
                 full_cudagraph_max_seq_len=full_cudagraph_max_seq_len,
+                full_cudagraph_tq_spec_decode_shared=(
+                    full_cudagraph_tq_spec_decode_shared
+                ),
             )
         )
 
@@ -6972,6 +7052,7 @@ class GPUModelRunner(
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
                 full_cudagraph_max_seq_len=desc.max_seq_len,
+                full_cudagraph_tq_spec_decode_shared=desc.tq_spec_decode_shared,
             )
         if num_warmups > 0:
             # Warmups may use auxiliary streams. Ensure all of their work has
@@ -6994,6 +7075,7 @@ class GPUModelRunner(
                 is_graph_capturing=True,
                 profile_seq_lens=profile_seq_lens,
                 full_cudagraph_max_seq_len=desc.max_seq_len,
+                full_cudagraph_tq_spec_decode_shared=desc.tq_spec_decode_shared,
             )
 
     def _capture_cudagraphs(
@@ -7241,6 +7323,10 @@ class GPUModelRunner(
             self.cudagraph_dispatcher.specialize_full_cudagraphs_by_max_seq_len(
                 self.full_cudagraph_max_seq_len_buckets
             )
+            if self.uniform_decode_query_len == 4:
+                self.cudagraph_dispatcher.specialize_full_cudagraphs_for_tq_spec_decode(
+                    (8, 16)
+                )
         else:
             self.full_cudagraph_max_seq_len_buckets = None
 

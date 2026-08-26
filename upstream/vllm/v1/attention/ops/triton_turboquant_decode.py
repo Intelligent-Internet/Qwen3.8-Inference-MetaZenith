@@ -738,6 +738,7 @@ def triton_turboquant_decode_attention(
     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
     block_kv: int = 2,
     use_head_parallel_stage1: bool = False,
+    tq_spec_decode_shared: bool = False,
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -808,7 +809,26 @@ def triton_turboquant_decode_attention(
         and kv_cache.shape[3] == 262
         and scale == 0.0625
     )
-    if use_native_head_parallel:
+    use_tq_spec_decode_shared = (
+        use_six_scalar
+        and tq_spec_decode_shared
+        and current_platform.is_cuda()
+        and B in (8, 16)
+        and block_size == 16
+        and kv_cache.shape[3] == 262
+        and NUM_KV_SPLITS == 32
+        and scale == 0.0625
+    )
+    if use_tq_spec_decode_shared:
+        torch.ops._C.turboquant_shared_rows_stage1(
+            q_rot,
+            kv_cache,
+            block_table,
+            seq_lens,
+            centroids,
+            mid_o,
+        )
+    elif use_native_head_parallel:
         torch.ops._C.turboquant_head_parallel_stage1(
             q_rot,
             kv_cache,

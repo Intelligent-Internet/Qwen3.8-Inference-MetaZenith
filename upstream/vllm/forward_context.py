@@ -50,6 +50,12 @@ class BatchDescriptor:
     captured kernel changes by context regime can use this to keep distinct
     graph variants. None for unspecialized FULL and all PIECEWISE graphs.
     """
+    tq_spec_decode_shared: bool = False
+    """
+    Whether this FULL graph uses exact TurboQuant K/V dequantization sharing
+    across the causal rows of speculative verification. False for all
+    unspecialized, PIECEWISE, and eager execution.
+    """
     has_lora: bool = False
     """
     Whether this batch has active LoRA adapters.

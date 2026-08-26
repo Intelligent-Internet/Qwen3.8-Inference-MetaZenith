@@ -26,6 +26,7 @@ import torch.nn.functional as F
 
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
 )
@@ -79,6 +80,10 @@ TURBOQUANT_FULL_CUDAGRAPH_MAX_SEQ_LENS = (
     TURBOQUANT_DECODE_TILE_CONTEXT_THRESHOLD,
     TURBOQUANT_HEAD_PARALLEL_CONTEXT_THRESHOLD,
 )
+TURBOQUANT_SPEC_DECODE_NUM_SPLITS = 32
+TURBOQUANT_SPEC_NUM_KV_HEADS = 4
+TURBOQUANT_SPEC_SLOT_SIZE_BYTES = 262
+TURBOQUANT_SPEC_PAIR_MIN_KV_BYTES = 90 * 1024 * 1024
 
 
 def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
@@ -522,8 +527,21 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seq_len=attn_metadata.max_seq_len,
                 is_prefill=False,
             )
+            batch_descriptor = get_forward_context().batch_descriptor
+            tq_spec_decode_shared = (
+                _k1 == 4
+                and batch_descriptor is not None
+                and batch_descriptor.tq_spec_decode_shared
+            )
             attn_out = self._decode_attention(
-                q, kv_cache, _synth_meta, Pi, centroids, PiT, layer
+                q,
+                kv_cache,
+                _synth_meta,
+                Pi,
+                centroids,
+                PiT,
+                layer,
+                tq_spec_decode_shared=tq_spec_decode_shared,
             )
             if output.ndim == 3:
                 output[:N] = attn_out.to(output.dtype)
@@ -974,6 +992,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         centroids: torch.Tensor,
         PiT: torch.Tensor | None = None,
         layer: torch.nn.Module | None = None,
+        tq_spec_decode_shared: bool = False,
     ) -> torch.Tensor:
         # Acquire shared decode scratch buffers from WorkspaceManager.
         # Layers execute sequentially so one set of buffers is sufficient.
@@ -1024,5 +1043,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     >= TURBOQUANT_HEAD_PARALLEL_CONTEXT_THRESHOLD
                 )
             ),
+            tq_spec_decode_shared=tq_spec_decode_shared,
         )
         return result

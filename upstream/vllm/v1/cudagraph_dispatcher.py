@@ -178,6 +178,22 @@ class CudagraphDispatcher:
             for max_seq_len in max_seq_lens
         }
 
+    def specialize_full_cudagraphs_for_tq_spec_decode(
+        self, eligible_num_tokens: tuple[int, ...]
+    ) -> None:
+        """Add exact shared-row variants for eligible uniform FULL graphs."""
+        assert self.keys_initialized
+        assert eligible_num_tokens
+        full_keys = self.cudagraph_keys[CUDAGraphMode.FULL]
+        assert all(not key.tq_spec_decode_shared for key in full_keys)
+        eligible = set(eligible_num_tokens)
+        shared_keys = {
+            replace(key, tq_spec_decode_shared=True)
+            for key in full_keys
+            if key.uniform and key.num_tokens in eligible
+        }
+        self.cudagraph_keys[CUDAGraphMode.FULL] = full_keys | shared_keys
+
     def initialize_cudagraph_keys(
         self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1
     ):
@@ -254,6 +270,7 @@ class CudagraphDispatcher:
         has_lora: bool = False,
         num_active_loras: int = 0,
         full_cudagraph_max_seq_len: int | None = None,
+        full_cudagraph_tq_spec_decode_shared: bool = False,
         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
@@ -271,6 +288,8 @@ class CudagraphDispatcher:
             num_active_loras: Number of distinct active LoRA adapters.
             full_cudagraph_max_seq_len: Compile-time context bucket for a
                 specialized FULL graph. None for unspecialized graphs.
+            full_cudagraph_tq_spec_decode_shared: Select the exact TurboQuant
+                speculative-row sharing variant of an eligible FULL graph.
             valid_modes: Set of cudagraph modes that are allowed. None means
                 all modes are allowed.
             invalid_modes: Set of cudagraph modes to exclude. Subtracted from
@@ -325,7 +344,9 @@ class CudagraphDispatcher:
         if CUDAGraphMode.FULL in allowed_modes:
             # check if key exists for full cudagraph
             batch_desc_to_check = replace(
-                batch_desc, max_seq_len=full_cudagraph_max_seq_len
+                batch_desc,
+                max_seq_len=full_cudagraph_max_seq_len,
+                tq_spec_decode_shared=full_cudagraph_tq_spec_decode_shared,
             )
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.FULL]:
                 return CUDAGraphMode.FULL, batch_desc_to_check
@@ -334,7 +355,11 @@ class CudagraphDispatcher:
             # also check if the relaxed key exists for more "general"
             # piecewise cudagraph
             batch_desc_to_check = replace(
-                batch_desc, num_reqs=None, uniform=False, max_seq_len=None
+                batch_desc,
+                num_reqs=None,
+                uniform=False,
+                max_seq_len=None,
+                tq_spec_decode_shared=False,
             )
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
                 return CUDAGraphMode.PIECEWISE, batch_desc_to_check
@@ -369,6 +394,7 @@ class CudagraphDispatcher:
                         d.num_tokens,
                         d.num_active_loras,
                         d.max_seq_len or 0,
+                        d.tq_spec_decode_shared,
                     ),
                     reverse=True,
                 )

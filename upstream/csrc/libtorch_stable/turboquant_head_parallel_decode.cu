@@ -251,6 +251,206 @@ __global__ void turboquant_head_parallel_stage1_kernel(
   }
 }
 
+// Producer/consumer form of the exact head-parallel kernel.  Dedicated loader
+// warps prepare the following token tile while the first three warps execute
+// the unchanged per-head attention math on the current tile.  The two
+// CTA-wide barriers form the buffer-ready/buffer-released handoff.
+template <int kTileTokens>
+__global__ void turboquant_head_parallel_stage1_pipeline_kernel(
+    const float* __restrict__ query, const uint8_t* __restrict__ cache,
+    const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ seq_lens,
+    const float* __restrict__ centroids, float* __restrict__ output,
+    int64_t cache_block_stride, int64_t cache_position_stride,
+    int64_t cache_head_stride, int64_t table_stride) {
+  static_assert(kTileTokens >= 4 && kTileTokens % 2 == 0);
+  const int batch = blockIdx.x;
+  const int kv_head = blockIdx.y;
+  const int split = blockIdx.z;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const bool compute_warp = warp < kHeadWarps;
+  const int loader_token = warp - kHeadWarps;
+
+  const int seq_len = seq_lens[batch];
+  const int split_len = (seq_len + kNumSplits - 1) / kNumSplits;
+  const int split_start = split_len * split;
+  const int split_end = min(split_start + split_len, seq_len);
+  const int split_tokens = max(split_end - split_start, 0);
+  const int num_tiles =
+      (split_tokens + kTileTokens - 1) / kTileTokens;
+
+  float q[kHeadsPerWarp][8];
+  float accum[kHeadsPerWarp][8];
+#pragma unroll
+  for (int h = 0; h < kHeadsPerWarp; ++h) {
+    const int local_head = warp * kHeadsPerWarp + h;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int d = lane + i * 32;
+      q[h][i] = compute_warp
+                    ? query[(batch * kNumQueryHeads +
+                             kv_head * (kHeadWarps * kHeadsPerWarp) +
+                             local_head) *
+                                kHeadDim +
+                            d]
+                    : 0.0f;
+      accum[h][i] = 0.0f;
+    }
+  }
+
+  const float negative_infinity = __int_as_float(0xff800000);
+  float m[kHeadsPerWarp];
+  float l[kHeadsPerWarp];
+#pragma unroll
+  for (int h = 0; h < kHeadsPerWarp; ++h) {
+    m[h] = negative_infinity;
+    l[h] = 0.0f;
+  }
+
+  __shared__ float shared_key[2][kTileTokens][kHeadDim];
+  __shared__ float shared_value[2][kTileTokens][kHeadDim];
+  __shared__ float shared_key_norm[2][kTileTokens];
+
+  auto load_tile = [&](int tile, int buffer) {
+    if (loader_token < 0 || loader_token >= kTileTokens) {
+      return;
+    }
+    const int position =
+        split_start + tile * kTileTokens + loader_token;
+    const bool valid = position < split_end;
+    const int page = position / kBlockSize;
+    const int page_offset = position - page * kBlockSize;
+    const int block = valid
+                          ? block_table[batch * table_stride + page]
+                          : 0;
+    const uint8_t* slot =
+        cache + static_cast<int64_t>(block) * cache_block_stride +
+        static_cast<int64_t>(page_offset) * cache_position_stride +
+        static_cast<int64_t>(kv_head) * cache_head_stride;
+
+    const float value_scale = valid ? unpack_half(slot + 258) : 0.0f;
+    const float value_zero = valid ? unpack_half(slot + 260) : 0.0f;
+    float key_part[8];
+    float value_part[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int d = lane + i * 32;
+      const uint8_t key_byte = valid ? slot[d >> 1] : 0;
+      const int key_idx = (key_byte >> ((d & 1) * 4)) & 15;
+      key_part[i] = valid ? centroids[key_idx] : 0.0f;
+      const uint8_t value_byte = valid ? slot[130 + (d >> 1)] : 0;
+      const float value_idx = static_cast<float>(
+          (value_byte >> ((d & 1) * 4)) & 15);
+      value_part[i] = value_idx * value_scale + value_zero;
+    }
+
+    float norm_terms[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      norm_terms[i] = key_part[i] * key_part[i];
+    }
+    const float norm_sq = warp_sum(lane_reduce8(norm_terms));
+    const float inv_norm =
+        triton_div(1.0f, triton_sqrt(norm_sq + 1.0e-16f));
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int d = lane + i * 32;
+      shared_key[buffer][loader_token][d] = key_part[i] * inv_norm;
+      shared_value[buffer][loader_token][d] = value_part[i];
+    }
+    if (lane == 0) {
+      shared_key_norm[buffer][loader_token] =
+          valid ? unpack_half(slot + 128) : 0.0f;
+    }
+  };
+
+  if (num_tiles > 0) {
+    load_tile(0, 0);
+  }
+  __syncthreads();
+
+  for (int tile = 0; tile < num_tiles; ++tile) {
+    const int buffer = tile & 1;
+    if (tile + 1 < num_tiles) {
+      load_tile(tile + 1, buffer ^ 1);
+    }
+
+    if (compute_warp) {
+#pragma unroll
+      for (int pair = 0; pair < kTileTokens / 2; ++pair) {
+        const int token0 = pair * 2;
+        const int token1 = token0 + 1;
+        const bool valid0 =
+            tile * kTileTokens + token0 < split_tokens;
+        const bool valid1 =
+            tile * kTileTokens + token1 < split_tokens;
+        float score0[kHeadsPerWarp];
+        float score1[kHeadsPerWarp];
+#pragma unroll
+        for (int h = 0; h < kHeadsPerWarp; ++h) {
+          float products0[8];
+          float products1[8];
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            const int d = lane + i * 32;
+            products0[i] = q[h][i] * shared_key[buffer][token0][d];
+            products1[i] = q[h][i] * shared_key[buffer][token1][d];
+          }
+          float s0 = warp_sum(lane_reduce8(products0));
+          float s1 = warp_sum(lane_reduce8(products1));
+          s0 = s0 * shared_key_norm[buffer][token0] * kAttentionScale;
+          s1 = s1 * shared_key_norm[buffer][token1] * kAttentionScale;
+          score0[h] = valid0 ? s0 : negative_infinity;
+          score1[h] = valid1 ? s1 : negative_infinity;
+        }
+
+#pragma unroll
+        for (int h = 0; h < kHeadsPerWarp; ++h) {
+          const float next_m = fmaxf(fmaxf(score0[h], score1[h]), m[h]);
+          const float rescale = triton_exp(m[h] - next_m);
+          const float p0 = triton_exp(score0[h] - next_m);
+          const float p1 = triton_exp(score1[h] - next_m);
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            const int d = lane + i * 32;
+            const float weighted =
+                p0 * shared_value[buffer][token0][d] +
+                p1 * shared_value[buffer][token1][d];
+            accum[h][i] = accum[h][i] * rescale + weighted;
+          }
+          l[h] = l[h] * rescale + (p0 + p1);
+          m[h] = next_m;
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  if (compute_warp) {
+#pragma unroll
+    for (int h = 0; h < kHeadsPerWarp; ++h) {
+      const int local_head = warp * kHeadsPerWarp + h;
+      const float safe_l = l[h] > 0.0f ? l[h] : 1.0f;
+      float* out_head =
+          output + ((batch * kNumQueryHeads +
+                     kv_head * (kHeadWarps * kHeadsPerWarp) + local_head) *
+                        kNumSplits +
+                    split) *
+                       (kHeadDim + 1);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int d = lane + i * 32;
+        out_head[d] = triton_div(accum[h][i], safe_l);
+      }
+      if (lane == 0) {
+        out_head[kHeadDim] =
+            split_tokens > 0 ? m[h] + logf(safe_l) : 0.0f;
+      }
+    }
+  }
+}
+
 template <int kTileTokens>
 void launch_turboquant_head_parallel(
     const float* query, const uint8_t* cache, const int32_t* block_table,
@@ -262,6 +462,23 @@ void launch_turboquant_head_parallel(
                   kNumSplits);
   turboquant_head_parallel_stage1_kernel<kTileTokens>
       <<<grid, kTileTokens * 32, 0, stream>>>(
+          query, cache, block_table, seq_lens, centroids, output,
+          cache_block_stride, cache_position_stride, cache_head_stride,
+          table_stride);
+}
+
+template <int kTileTokens>
+void launch_turboquant_head_parallel_pipeline(
+    const float* query, const uint8_t* cache, const int32_t* block_table,
+    const int32_t* seq_lens, const float* centroids, float* output,
+    int64_t batch_size, int64_t cache_block_stride,
+    int64_t cache_position_stride, int64_t cache_head_stride,
+    int64_t table_stride, cudaStream_t stream) {
+  const dim3 grid(static_cast<unsigned int>(batch_size), kNumKvHeads,
+                  kNumSplits);
+  constexpr int kWarps = kHeadWarps + kTileTokens;
+  turboquant_head_parallel_stage1_pipeline_kernel<kTileTokens>
+      <<<grid, kWarps * 32, 0, stream>>>(
           query, cache, block_table, seq_lens, centroids, output,
           cache_block_stride, cache_position_stride, cache_head_stride,
           table_stride);
@@ -332,32 +549,10 @@ void turboquant_head_parallel_stage1(
   const int64_t cache_head_stride = cache.stride(2);
   const int64_t table_stride = block_table.stride(0);
 
-  switch (batch_size) {
-    case 1:
-      launch_turboquant_head_parallel<16>(
-          query_ptr, cache_ptr, table_ptr, seq_ptr, centroids_ptr, output_ptr,
-          batch_size, cache_block_stride, cache_position_stride,
-          cache_head_stride, table_stride, stream);
-      break;
-    case 2:
-      launch_turboquant_head_parallel<12>(
-          query_ptr, cache_ptr, table_ptr, seq_ptr, centroids_ptr, output_ptr,
-          batch_size, cache_block_stride, cache_position_stride,
-          cache_head_stride, table_stride, stream);
-      break;
-    case 3:
-      launch_turboquant_head_parallel<8>(
-          query_ptr, cache_ptr, table_ptr, seq_ptr, centroids_ptr, output_ptr,
-          batch_size, cache_block_stride, cache_position_stride,
-          cache_head_stride, table_stride, stream);
-      break;
-    case 4:
-      launch_turboquant_head_parallel<6>(
-          query_ptr, cache_ptr, table_ptr, seq_ptr, centroids_ptr, output_ptr,
-          batch_size, cache_block_stride, cache_position_stride,
-          cache_head_stride, table_stride, stream);
-      break;
-  }
+  launch_turboquant_head_parallel_pipeline<8>(
+      query_ptr, cache_ptr, table_ptr, seq_ptr, centroids_ptr, output_ptr,
+      batch_size, cache_block_stride, cache_position_stride,
+      cache_head_stride, table_stride, stream);
   const cudaError_t error = cudaGetLastError();
   STD_TORCH_CHECK(error == cudaSuccess,
                   "turboquant_head_parallel_stage1 failed: ",

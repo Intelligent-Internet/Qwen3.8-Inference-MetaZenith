@@ -254,6 +254,198 @@ __global__ __launch_bounds__(128, 2) void turboquant_shared_rows_stage1_kernel(
   }
 }
 
+// Four B16 warps can cooperatively dequantize a larger KV tile without
+// serializing the loaders.  Keep the exact two-token online-softmax update
+// order, but amortize the CTA barriers over ten pairs.  B8 deliberately keeps
+// the two-token kernel above: its two loader warps lose to serialized loading
+// with this larger tile.
+__global__ __launch_bounds__(128, 2)
+void turboquant_shared_rows_tile20_stage1_kernel(
+    const float* __restrict__ query, const uint8_t* __restrict__ cache,
+    const int* __restrict__ block_table, const int* __restrict__ seq_lens,
+    const float* __restrict__ centroids, float* __restrict__ output,
+    long long cache_block_stride, long long cache_position_stride,
+    long long cache_head_stride, int table_stride) {
+  constexpr int kRows = 4;
+  constexpr int kTileTokens = 20;
+  const int group = blockIdx.x;
+  const int kv_head = blockIdx.y;
+  const int split = blockIdx.z;
+  const int row = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int batch = group * kRows + row;
+
+  const int seq_len = seq_lens[batch];
+  const int split_len = (seq_len + kSplits - 1) / kSplits;
+  const int common_split_len =
+      (seq_lens[group * kRows] + kSplits - 1) / kSplits;
+  const int split_start = split_len * split;
+  const int split_end = min(split_start + split_len, seq_len);
+  const int row_split_tokens = max(split_end - split_start, 0);
+
+  float q[6][8];
+  float accum[6][8];
+#pragma unroll
+  for (int head = 0; head < kHeadsPerKv; ++head) {
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      const int d = lane + k * 32;
+      q[head][k] =
+          query[(batch * kHeads + kv_head * kHeadsPerKv + head) * kHeadDim + d];
+      accum[head][k] = 0.0f;
+    }
+  }
+
+  const float negative_infinity = __int_as_float(0xff800000);
+  float m[6];
+  float l[6];
+#pragma unroll
+  for (int head = 0; head < kHeadsPerKv; ++head) {
+    m[head] = negative_infinity;
+    l[head] = 0.0f;
+  }
+
+  __shared__ float shared_key[kTileTokens][kHeadDim];
+  __shared__ float shared_value[kTileTokens][kHeadDim];
+  __shared__ float shared_key_norm[kTileTokens];
+
+  int max_split_tokens = 0;
+  int load_split_end = 0;
+#pragma unroll
+  for (int other_row = 0; other_row < kRows; ++other_row) {
+    const int other_seq_len = seq_lens[group * kRows + other_row];
+    const int other_split_len =
+        (other_seq_len + kSplits - 1) / kSplits;
+    const int other_start = other_split_len * split;
+    const int other_end = min(other_start + other_split_len, other_seq_len);
+    max_split_tokens = max(max_split_tokens, max(other_end - other_start, 0));
+    load_split_end = max(load_split_end, other_end);
+  }
+
+  for (int tile = 0; tile * kTileTokens < max_split_tokens; ++tile) {
+#pragma unroll
+    for (int token_in_tile = row; token_in_tile < kTileTokens;
+         token_in_tile += kRows) {
+      const int load_batch = group * kRows;
+      const int load_split_start = common_split_len * split;
+      const int position =
+          load_split_start + tile * kTileTokens + token_in_tile;
+      const bool valid = position < load_split_end;
+      const int page = position / kBlockSize;
+      const int page_offset = position - page * kBlockSize;
+      const int block = valid
+          ? block_table[load_batch * table_stride + page]
+          : 0;
+      const uint8_t* slot =
+          cache + static_cast<long long>(block) * cache_block_stride +
+          static_cast<long long>(page_offset) * cache_position_stride +
+          static_cast<long long>(kv_head) * cache_head_stride;
+
+      const float value_scale = valid ? unpack_half(slot + 258) : 0.0f;
+      const float value_zero = valid ? unpack_half(slot + 260) : 0.0f;
+      float key_part[8];
+      float value_part[8];
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        const int d = lane + k * 32;
+        const uint8_t key_byte = valid ? slot[d >> 1] : 0;
+        const int key_idx = (key_byte >> ((d & 1) * 4)) & 15;
+        key_part[k] = valid ? centroids[key_idx] : 0.0f;
+        const uint8_t value_byte = valid ? slot[130 + (d >> 1)] : 0;
+        const float value_idx = static_cast<float>(
+            (value_byte >> ((d & 1) * 4)) & 15);
+        value_part[k] = value_idx * value_scale + value_zero;
+      }
+
+      float norm_terms[8];
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        norm_terms[k] = key_part[k] * key_part[k];
+      }
+      const float norm_sq = warp_sum(lane_reduce8(norm_terms));
+      const float inv_norm = tq_div(1.0f, tq_sqrt(norm_sq + 1.0e-16f));
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        const int d = lane + k * 32;
+        shared_key[token_in_tile][d] = key_part[k] * inv_norm;
+        shared_value[token_in_tile][d] = value_part[k];
+      }
+      if (lane == 0) {
+        shared_key_norm[token_in_tile] =
+            valid ? unpack_half(slot + 128) : 0.0f;
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int pair = 0; pair < kTileTokens / 2; ++pair) {
+      const int token0 = pair * 2;
+      const int token1 = token0 + 1;
+      if (tile * kTileTokens + token0 >= row_split_tokens) {
+        continue;
+      }
+      const bool valid1 =
+          tile * kTileTokens + token1 < row_split_tokens;
+      float score0[6];
+      float score1[6];
+#pragma unroll
+      for (int head = 0; head < kHeadsPerKv; ++head) {
+        float products0[8];
+        float products1[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+          const int d = lane + k * 32;
+          products0[k] = q[head][k] * shared_key[token0][d];
+          products1[k] = q[head][k] * shared_key[token1][d];
+        }
+        float s0 = warp_sum(lane_reduce8(products0));
+        float s1 = warp_sum(lane_reduce8(products1));
+        s0 = s0 * shared_key_norm[token0] * kAttentionScale;
+        s1 = s1 * shared_key_norm[token1] * kAttentionScale;
+        score0[head] = s0;
+        score1[head] = valid1 ? s1 : negative_infinity;
+      }
+
+#pragma unroll
+      for (int head = 0; head < kHeadsPerKv; ++head) {
+        const float next_m =
+            fmaxf(fmaxf(score0[head], score1[head]), m[head]);
+        const float rescale = tq_exp(m[head] - next_m);
+        const float p0 = tq_exp(score0[head] - next_m);
+        const float p1 = tq_exp(score1[head] - next_m);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+          const int d = lane + k * 32;
+          const float weighted =
+              p0 * shared_value[token0][d] +
+              p1 * shared_value[token1][d];
+          accum[head][k] = accum[head][k] * rescale + weighted;
+        }
+        l[head] = l[head] * rescale + (p0 + p1);
+        m[head] = next_m;
+      }
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int head = 0; head < kHeadsPerKv; ++head) {
+    const float safe_l = l[head] > 0.0f ? l[head] : 1.0f;
+    float* out_head = output +
+        ((batch * kHeads + kv_head * kHeadsPerKv + head) * kSplits + split) *
+            (kHeadDim + 1);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      const int d = lane + k * 32;
+      out_head[d] = tq_div(accum[head][k], safe_l);
+    }
+    if (lane == 0) {
+      out_head[kHeadDim] =
+          row_split_tokens > 0 ? m[head] + logf(safe_l) : 0.0f;
+    }
+  }
+}
+
 }  // namespace
 
 void turboquant_shared_rows_stage1(const torch::stable::Tensor& query,
@@ -313,7 +505,7 @@ void turboquant_shared_rows_stage1(const torch::stable::Tensor& query,
         static_cast<int>(block_table.stride(0)));
   } else {
     const dim3 grid(batch_size / 4, kKvHeads, kSplits);
-    turboquant_shared_rows_stage1_kernel<4><<<grid, 128, 0, stream>>>(
+    turboquant_shared_rows_tile20_stage1_kernel<<<grid, 128, 0, stream>>>(
         query.const_data_ptr<float>(), cache.const_data_ptr<uint8_t>(),
         block_table.const_data_ptr<int>(), seq_lens.const_data_ptr<int>(),
         centroids.const_data_ptr<float>(), output.mutable_data_ptr<float>(),

@@ -4261,13 +4261,16 @@ class GPUModelRunner(
 
             full_cudagraph_max_seq_len = None
             if self.full_cudagraph_max_seq_len_buckets is not None:
-                short_bucket, long_bucket = self.full_cudagraph_max_seq_len_buckets
                 max_seq_len = int(
                     self.optimistic_seq_lens_cpu[:num_reqs].max()
                 )
                 full_cudagraph_max_seq_len = (
-                    short_bucket if max_seq_len < long_bucket else long_bucket
+                    self.full_cudagraph_max_seq_len_buckets[0]
                 )
+                for bucket in self.full_cudagraph_max_seq_len_buckets[1:]:
+                    if max_seq_len < bucket:
+                        break
+                    full_cudagraph_max_seq_len = bucket
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,

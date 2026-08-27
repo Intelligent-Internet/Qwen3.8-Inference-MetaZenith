@@ -408,6 +408,7 @@ def fused_sigmoid_gating_delta_rule_update_packed(
     beta: float = 1.0,
     threshold: float = 20.0,
     scale: float | None = None,
+    output: torch.Tensor | None = None,
 ):
     """Bitwise-equivalent speculative GDN update from packed q/k/v input."""
     if mixed_qkv.ndim != 2 or mixed_qkv.stride(-1) != 1:
@@ -438,7 +439,18 @@ def fused_sigmoid_gating_delta_rule_update_packed(
     else:
         assert scale > 0, "scale must be positive"
 
-    output = mixed_qkv.new_empty(1, T, HV, V)
+    expected_output_shape = (1, T, HV, V)
+    if output is None:
+        output = mixed_qkv.new_empty(expected_output_shape)
+    elif (
+        output.shape != expected_output_shape
+        or output.dtype != mixed_qkv.dtype
+        or output.device != mixed_qkv.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError(
+            "`output` must be a contiguous tensor matching packed GDN output"
+        )
     stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
     grid = (NK, NV, N * HV)
     fused_sigmoid_gating_delta_rule_update_packed_kernel[grid](

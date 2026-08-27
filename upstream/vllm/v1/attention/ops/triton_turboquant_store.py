@@ -222,7 +222,7 @@ def _tq_fused_store_mse(
     # Post-rotation inputs
     Y_ptr,  # [NH, D] float32 — rotated normalized keys (x_hat @ PiT)
     Norms_ptr,  # [NH] float32 — key vector norms (||k||)
-    Value_ptr,  # [NH, D] float32 — raw values
+    Value_ptr,  # [N, H, D] BF16 — raw values
     # Quantization tables
     Midpoints_ptr,  # [n_centroids-1] float32
     # Cache and indexing
@@ -232,6 +232,8 @@ def _tq_fused_store_mse(
     stride_cache_block: tl.constexpr,
     stride_cache_pos: tl.constexpr,
     stride_cache_head: tl.constexpr,
+    stride_value_token: tl.constexpr,
+    stride_value_head: tl.constexpr,
     # Dimensions
     D: tl.constexpr,
     H: tl.constexpr,
@@ -272,6 +274,7 @@ def _tq_fused_store_mse(
     )
 
     base = pid * D
+    value_base = token_idx * stride_value_token + head_idx * stride_value_head
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < D
 
@@ -328,7 +331,7 @@ def _tq_fused_store_mse(
     _store_quantized_value(
         Value_ptr,
         KV_cache_ptr,
-        base,
+        value_base,
         slot_base,
         d_offs,
         d_mask,
@@ -410,26 +413,26 @@ def triton_turboquant_store(
         return
 
     # ── MSE PATH: external GEMM + fused bucketize/pack kernel ──
-    # Normalize + rotation GEMM externally (cuBLAS is faster than in-kernel)
-    k_flat = key.float().reshape(NH, D)
-    norms = k_flat.norm(dim=1, keepdim=True)
-    x_hat = k_flat / (norms + 1e-8)
-    y = x_hat @ PiT
-
-    v_flat = value.float().reshape(NH, D)
+    # Preserve FP32 normalization and value quantization while avoiding
+    # standalone BF16-to-FP32 materialization buffers.
+    norms = torch.linalg.vector_norm(key, dim=-1, keepdim=True, dtype=torch.float32)
+    x_hat = key / (norms + 1e-8)
+    y = x_hat.reshape(NH, D) @ PiT
 
     # Fused kernel: bucketize + MSE index pack + norm store + value pack
     grid = (NH,)
     _tq_fused_store_mse[grid](
         y,
-        norms.squeeze(1),
-        v_flat,
+        norms.reshape(NH),
+        value,
         midpoints,
         kv_cache,
         slot_mapping,
         stride_cache_block=stride_block,
         stride_cache_pos=stride_pos,
         stride_cache_head=stride_head,
+        stride_value_token=value.stride(0),
+        stride_value_head=value.stride(1),
         D=D,
         H=H,
         BLOCK_SIZE=block_size,

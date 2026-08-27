@@ -1373,8 +1373,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
+        direct_spec_output = None
         if spec_sequence_masks is not None:
             assert mixed_qkv_spec is not None
+            # Pure speculative tokens are already in caller-output order.
+            # Mixed spec/non-spec batches still use the scatter merge below.
+            if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
+                direct_spec_output = core_attn_out[:num_actual_tokens].unsqueeze(0)
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update_packed(
                     A_log=self.A_log,
@@ -1389,6 +1394,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     ],
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=num_accepted_tokens,
+                    output=direct_spec_output,
                 )
             )
         else:
@@ -1430,6 +1436,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert prefill_has_initial_state is not None
             initial_state = ssm_state[prefill_state_indices]
             initial_state[~prefill_has_initial_state, ...] = 0
+            direct_prefill_output = None
+            if spec_sequence_masks is None and not split_non_spec:
+                direct_prefill_output = core_attn_out[:num_actual_tokens]
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1445,6 +1454,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
+                core_attn_out=direct_prefill_output,
             )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
@@ -1489,9 +1499,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
-            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+            if direct_spec_output is None:
+                core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
-            core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+            if attn_metadata.num_prefills == 0 or direct_prefill_output is None:
+                core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
     def _forward_core_decode_aiter(
         self,

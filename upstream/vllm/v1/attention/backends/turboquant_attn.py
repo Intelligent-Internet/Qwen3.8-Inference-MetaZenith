@@ -542,7 +542,14 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 PiT,
                 layer,
                 tq_spec_decode_shared=tq_spec_decode_shared,
+                direct_output=(
+                    output[:N].view(N, self.num_heads, self.head_size)
+                    if output.dtype == q.dtype and output.is_contiguous()
+                    else None
+                ),
             )
+            if attn_out.data_ptr() == output.data_ptr():
+                return output
             if output.ndim == 3:
                 output[:N] = attn_out.to(output.dtype)
             else:
@@ -551,8 +558,20 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         if not attn_metadata.is_prefill:
             # Pure decode batch — fast path
+            direct_decode_output = (
+                output[:N].view(N, self.num_heads, self.head_size)
+                if output.dtype == q.dtype and output.is_contiguous()
+                else None
+            )
             attn_out = self._decode_attention(
-                q, kv_cache, attn_metadata, Pi, centroids, PiT, layer
+                q,
+                kv_cache,
+                attn_metadata,
+                Pi,
+                centroids,
+                PiT,
+                layer,
+                direct_output=direct_decode_output,
             )
         elif num_decodes == 0:
             # Pure prefill batch
@@ -587,8 +606,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seq_len=attn_metadata.max_seq_len,
                 is_prefill=False,
             )
-            attn_out[:num_decode_tokens] = self._decode_attention(
-                q[:num_decode_tokens], kv_cache, decode_meta, Pi, centroids, PiT, layer
+            self._decode_attention(
+                q[:num_decode_tokens],
+                kv_cache,
+                decode_meta,
+                Pi,
+                centroids,
+                PiT,
+                layer,
+                direct_output=attn_out[:num_decode_tokens],
             )
 
             # --- Prefill portion (remaining requests) ---
@@ -642,6 +668,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         # Write into output buffer: attn_out is (N, Hq, D)
         # output may be 2D (N, Hq*D) or 3D (N, Hq, D)
+        if not attn_metadata.is_prefill and attn_out.data_ptr() == output.data_ptr():
+            return output
         if output.ndim == 3:
             output[:N] = attn_out.to(output.dtype)
         else:
@@ -993,6 +1021,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         PiT: torch.Tensor | None = None,
         layer: torch.nn.Module | None = None,
         tq_spec_decode_shared: bool = False,
+        direct_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Acquire shared decode scratch buffers from WorkspaceManager.
         # Layers execute sequentially so one set of buffers is sufficient.
@@ -1011,6 +1040,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     ((B, Hq), torch.float32),
                 )
             )
+        if direct_output is not None:
+            output_buf = direct_output
 
         result = triton_turboquant_decode_attention(
             query=query,

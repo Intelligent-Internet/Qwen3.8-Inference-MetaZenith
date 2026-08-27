@@ -158,14 +158,8 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     minimax_m3_msa_warmup(worker)
 
-    enable_flashinfer_autotune = (
-        worker.vllm_config.kernel_config.enable_flashinfer_autotune
-    )
-    # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
-    if enable_flashinfer_autotune is False:
-        logger.info_once("Skipping FlashInfer autotune because it is disabled.")
-    elif has_flashinfer() and current_platform.has_device_capability(90):
-        flashinfer_autotune(worker.model_runner)
+    if not getattr(worker, "_flashinfer_autotuned_pre_kv", False):
+        maybe_flashinfer_autotune(worker)
 
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
@@ -296,3 +290,15 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         world.barrier()
     if is_leader:
         tuner.save_configs(str(cache_path))
+
+
+def maybe_flashinfer_autotune(worker: "Worker") -> None:
+    """Run FlashInfer tuning once on supported devices."""
+    enable_flashinfer_autotune = (
+        worker.vllm_config.kernel_config.enable_flashinfer_autotune
+    )
+    if enable_flashinfer_autotune is False:
+        logger.info_once("Skipping FlashInfer autotune because it is disabled.")
+    elif has_flashinfer() and current_platform.has_device_capability(90):
+        flashinfer_autotune(worker.model_runner)
+        worker._flashinfer_autotuned_pre_kv = True

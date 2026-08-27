@@ -52,7 +52,10 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
+from vllm.model_executor.warmup.kernel_warmup import (
+    kernel_warmup,
+    maybe_flashinfer_autotune,
+)
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -475,6 +478,8 @@ class Worker(WorkerBase):
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+            maybe_flashinfer_autotune(self)
+            torch.accelerator.empty_cache()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -603,6 +608,12 @@ class Worker(WorkerBase):
                     current_util,
                     suggested_util,
                 )
+
+        # Tune while only the profiling KV cache has existed. The production
+        # KV cache intentionally consumes the remaining memory budget and can
+        # leave too little room to synthesize the largest tuning bucket.
+        maybe_flashinfer_autotune(self)
+        torch.accelerator.empty_cache()
 
         return reserve_mm_ipc_gpu_memory(
             int(self.available_kv_cache_memory_bytes),

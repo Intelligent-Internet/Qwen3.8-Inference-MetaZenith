@@ -71,6 +71,10 @@ class SchedulerConfig:
     """For chunked prefill, a request is considered long if the prompt is
     longer than this number of tokens. 0 disables the cap (default)."""
 
+    adaptive_long_prefill_threshold: bool = False
+    """Expand the long-prefill cap to an equal share of the aggregate token
+    budget among prefills that can occupy request slots in the current step."""
+
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.

@@ -436,6 +436,40 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
+    def _get_long_prefill_token_threshold(self) -> int:
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if (
+            threshold == 0
+            or not self.scheduler_config.adaptive_long_prefill_threshold
+        ):
+            return threshold
+
+        running_prefills = sum(
+            request.num_computed_tokens < request.num_tokens - 1
+            for request in self.running
+        )
+        running_decodes = len(self.running) - running_prefills
+        available_prefill_slots = max(
+            self.max_num_running_reqs
+            - self.num_waiting_for_streaming_input
+            - running_decodes,
+            0,
+        )
+        if available_prefill_slots == 0:
+            return threshold
+
+        waiting_prefills = sum(
+            request.num_computed_tokens < request.num_tokens - 1
+            for request in itertools.chain(self.skipped_waiting, self.waiting)
+        )
+        active_prefills = min(
+            running_prefills + waiting_prefills,
+            available_prefill_slots,
+        )
+        if active_prefills == 0:
+            return threshold
+        return max(threshold, self.max_num_scheduled_tokens // active_prefills)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -457,6 +491,7 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        long_prefill_threshold = self._get_long_prefill_token_threshold()
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -518,8 +553,8 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            if 0 < long_prefill_threshold < num_new_tokens:
+                num_new_tokens = long_prefill_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -896,9 +931,8 @@ class Scheduler(SchedulerInterface):
                             break
                         pad_spec_decode = True
 
-                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
+                    if 0 < long_prefill_threshold < num_new_tokens:
+                        num_new_tokens = long_prefill_threshold
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked

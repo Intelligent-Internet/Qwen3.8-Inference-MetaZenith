@@ -962,13 +962,12 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
-                reserved_blocks = 0
-                if load_kv_async:
-                    # An async load holds its blocks for the whole transfer with
-                    # no forward progress and isn't preemptible here. Admit it
-                    # only if it fits in (free - other in-flight reservations), to
-                    # avoid deadlock and predictable preemptions.
-                    reserved_blocks = self._inflight_prefill_reserved_blocks()
+                # Preserve enough physical blocks for every already-admitted
+                # prefill to finish. This uses the hybrid coordinator's exact
+                # per-group allocation model rather than converting blocks to
+                # logical tokens. It also protects async loads, which hold their
+                # allocation without making forward progress.
+                reserved_blocks = self._inflight_prefill_reserved_blocks()
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -2614,9 +2613,12 @@ class Scheduler(SchedulerInterface):
     def _request_remaining_blocks(self, request: Request) -> int:
         """Blocks `request` still needs to allocate to hold its full sequence."""
         full_num_tokens = min(request.num_tokens, self.max_model_len)
+        full_num_slots = min(
+            full_num_tokens + self.num_lookahead_tokens, self.max_model_len
+        )
         return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
-            num_tokens=full_num_tokens,
+            num_tokens=full_num_slots,
             new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
             num_encoder_tokens=0,
             total_computed_tokens=request.num_computed_tokens,

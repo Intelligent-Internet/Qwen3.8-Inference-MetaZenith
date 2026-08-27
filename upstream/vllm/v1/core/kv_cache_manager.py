@@ -472,10 +472,13 @@ class KVCacheManager:
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
+            full_num_slots = min(
+                full_num_tokens + num_lookahead_tokens, self.max_model_len
+            )
 
             num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
                 request_id=request.request_id,
-                num_tokens=full_num_tokens,
+                num_tokens=full_num_slots,
                 new_computed_blocks=new_computed_block_list,
                 num_encoder_tokens=num_encoder_tokens,
                 total_computed_tokens=total_computed_tokens,
@@ -483,7 +486,9 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
+            required_blocks = (
+                num_blocks_to_allocate + watermark_blocks + reserved_blocks
+            )
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 

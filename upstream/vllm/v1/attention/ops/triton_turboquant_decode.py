@@ -734,11 +734,13 @@ def triton_turboquant_decode_attention(
     mid_o_buf: torch.Tensor | None = None,
     output_buf: torch.Tensor | None = None,
     lse_buf: torch.Tensor | None = None,
+    table_mismatch_buf: torch.Tensor | None = None,
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
     block_kv: int = 2,
     use_head_parallel_stage1: bool = False,
     tq_spec_decode_shared: bool = False,
+    tq_spec_decode_same_request_b4: bool = False,
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -819,7 +821,21 @@ def triton_turboquant_decode_attention(
         and NUM_KV_SPLITS == 32
         and scale == 0.0625
     )
-    if use_tq_spec_decode_shared:
+    use_tq_spec_decode_same_request_b4 = (
+        use_native_head_parallel and B == 4 and tq_spec_decode_same_request_b4
+    )
+    if use_tq_spec_decode_same_request_b4 or use_tq_spec_decode_shared:
+        if (
+            table_mismatch_buf is not None
+            and table_mismatch_buf.dtype == torch.int32
+            and table_mismatch_buf.numel() >= 1
+        ):
+            table_mismatch = table_mismatch_buf.view(-1)[:1]
+        else:
+            table_mismatch = torch.empty(1, dtype=torch.int32, device=device)
+    if use_tq_spec_decode_same_request_b4:
+        # Prove every active physical page on device, then split work between
+        # exact shared and champion fallback kernels using the same scalar.
         torch.ops._C.turboquant_shared_rows_stage1(
             q_rot,
             kv_cache,
@@ -827,6 +843,26 @@ def triton_turboquant_decode_attention(
             seq_lens,
             centroids,
             mid_o,
+            table_mismatch,
+        )
+        torch.ops._C.turboquant_head_parallel_stage1_boundary_b4(
+            q_rot,
+            kv_cache,
+            block_table,
+            seq_lens,
+            centroids,
+            mid_o,
+            table_mismatch,
+        )
+    elif use_tq_spec_decode_shared:
+        torch.ops._C.turboquant_shared_rows_stage1(
+            q_rot,
+            kv_cache,
+            block_table,
+            seq_lens,
+            centroids,
+            mid_o,
+            table_mismatch,
         )
     elif use_native_head_parallel:
         torch.ops._C.turboquant_head_parallel_stage1(

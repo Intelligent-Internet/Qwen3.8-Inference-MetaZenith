@@ -255,14 +255,15 @@ __global__ void turboquant_head_parallel_stage1_kernel(
 // warps prepare the following token tile while the first three warps execute
 // the unchanged per-head attention math on the current tile.  The two
 // CTA-wide barriers form the buffer-ready/buffer-released handoff.
-template <int kTileTokens>
+template <int kTileTokens, bool kBoundaryOnly = false>
 __global__ void turboquant_head_parallel_stage1_pipeline_kernel(
     const float* __restrict__ query, const uint8_t* __restrict__ cache,
     const int32_t* __restrict__ block_table,
     const int32_t* __restrict__ seq_lens,
     const float* __restrict__ centroids, float* __restrict__ output,
     int64_t cache_block_stride, int64_t cache_position_stride,
-    int64_t cache_head_stride, int64_t table_stride) {
+    int64_t cache_head_stride, int64_t table_stride,
+    const int32_t* __restrict__ table_mismatch) {
   static_assert(kTileTokens >= 4 && kTileTokens % 2 == 0);
   const int batch = blockIdx.x;
   const int kv_head = blockIdx.y;
@@ -271,6 +272,29 @@ __global__ void turboquant_head_parallel_stage1_pipeline_kernel(
   const int lane = threadIdx.x & 31;
   const bool compute_warp = warp < kHeadWarps;
   const int loader_token = warp - kHeadWarps;
+
+  // Complement the synthetic-row shared kernel.  The preceding proof launch
+  // covers every active page, and the four authoritative device lengths cover
+  // graph-time corrections.  Every CTA therefore makes the same decision.
+  __shared__ int share_safe;
+  if constexpr (kBoundaryOnly) {
+    if (threadIdx.x == 0) {
+      const int common_len = (seq_lens[0] + kNumSplits - 1) / kNumSplits;
+      share_safe = table_mismatch[0] == 0;
+#pragma unroll
+      for (int other_row = 1; other_row < 4; ++other_row) {
+        const int candidate =
+            (seq_lens[other_row] + kNumSplits - 1) / kNumSplits;
+        if (candidate != common_len) {
+          share_safe = 0;
+        }
+      }
+    }
+    __syncthreads();
+    if (share_safe) {
+      return;
+    }
+  }
 
   const int seq_len = seq_lens[batch];
   const int split_len = (seq_len + kNumSplits - 1) / kNumSplits;
@@ -467,30 +491,32 @@ void launch_turboquant_head_parallel(
           table_stride);
 }
 
-template <int kTileTokens>
+template <int kTileTokens, bool kBoundaryOnly = false>
 void launch_turboquant_head_parallel_pipeline(
     const float* query, const uint8_t* cache, const int32_t* block_table,
     const int32_t* seq_lens, const float* centroids, float* output,
     int64_t batch_size, int64_t cache_block_stride,
     int64_t cache_position_stride, int64_t cache_head_stride,
-    int64_t table_stride, cudaStream_t stream) {
+    int64_t table_stride, cudaStream_t stream,
+    const int32_t* table_mismatch = nullptr) {
   const dim3 grid(static_cast<unsigned int>(batch_size), kNumKvHeads,
                   kNumSplits);
   constexpr int kWarps = kHeadWarps + kTileTokens;
-  turboquant_head_parallel_stage1_pipeline_kernel<kTileTokens>
+  turboquant_head_parallel_stage1_pipeline_kernel<kTileTokens, kBoundaryOnly>
       <<<grid, kWarps * 32, 0, stream>>>(
           query, cache, block_table, seq_lens, centroids, output,
           cache_block_stride, cache_position_stride, cache_head_stride,
-          table_stride);
+          table_stride, table_mismatch);
 }
 
-void turboquant_head_parallel_stage1(
+void turboquant_head_parallel_stage1_impl(
     const torch::stable::Tensor& query,
     const torch::stable::Tensor& cache,
     const torch::stable::Tensor& block_table,
     const torch::stable::Tensor& seq_lens,
     const torch::stable::Tensor& centroids,
-    torch::stable::Tensor& output) {
+    torch::stable::Tensor& output,
+    const torch::stable::Tensor* table_mismatch, bool boundary_only) {
   STD_TORCH_CHECK(query.is_cuda() && cache.is_cuda() &&
                       block_table.is_cuda() && seq_lens.is_cuda() &&
                       centroids.is_cuda() && output.is_cuda(),
@@ -549,14 +575,55 @@ void turboquant_head_parallel_stage1(
   const int64_t cache_head_stride = cache.stride(2);
   const int64_t table_stride = block_table.stride(0);
 
-  launch_turboquant_head_parallel_pipeline<8>(
-      query_ptr, cache_ptr, table_ptr, seq_ptr, centroids_ptr, output_ptr,
-      batch_size, cache_block_stride, cache_position_stride,
-      cache_head_stride, table_stride, stream);
+  if (boundary_only) {
+    STD_TORCH_CHECK(batch_size == 4,
+                    "boundary-only TurboQuant requires B4");
+    STD_TORCH_CHECK(table_mismatch != nullptr && table_mismatch->is_cuda() &&
+                        table_mismatch->get_device_index() == device &&
+                        table_mismatch->scalar_type() ==
+                            torch::headeronly::ScalarType::Int &&
+                        table_mismatch->numel() == 1 &&
+                        table_mismatch->is_contiguous(),
+                    "boundary-only TurboQuant requires one int32 CUDA proof");
+    launch_turboquant_head_parallel_pipeline<8, true>(
+        query_ptr, cache_ptr, table_ptr, seq_ptr, centroids_ptr, output_ptr,
+        batch_size, cache_block_stride, cache_position_stride,
+        cache_head_stride, table_stride, stream,
+        table_mismatch->const_data_ptr<int32_t>());
+  } else {
+    launch_turboquant_head_parallel_pipeline<8, false>(
+        query_ptr, cache_ptr, table_ptr, seq_ptr, centroids_ptr, output_ptr,
+        batch_size, cache_block_stride, cache_position_stride,
+        cache_head_stride, table_stride, stream);
+  }
   const cudaError_t error = cudaGetLastError();
   STD_TORCH_CHECK(error == cudaSuccess,
                   "turboquant_head_parallel_stage1 failed: ",
                   cudaGetErrorString(error));
+}
+
+void turboquant_head_parallel_stage1(
+    const torch::stable::Tensor& query,
+    const torch::stable::Tensor& cache,
+    const torch::stable::Tensor& block_table,
+    const torch::stable::Tensor& seq_lens,
+    const torch::stable::Tensor& centroids,
+    torch::stable::Tensor& output) {
+  turboquant_head_parallel_stage1_impl(
+      query, cache, block_table, seq_lens, centroids, output, nullptr, false);
+}
+
+void turboquant_head_parallel_stage1_boundary_b4(
+    const torch::stable::Tensor& query,
+    const torch::stable::Tensor& cache,
+    const torch::stable::Tensor& block_table,
+    const torch::stable::Tensor& seq_lens,
+    const torch::stable::Tensor& centroids,
+    torch::stable::Tensor& output,
+    const torch::stable::Tensor& table_mismatch) {
+  turboquant_head_parallel_stage1_impl(
+      query, cache, block_table, seq_lens, centroids, output,
+      &table_mismatch, true);
 }
 
 }  // namespace
@@ -565,9 +632,15 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, m) {
   m.def(
       "turboquant_head_parallel_stage1(Tensor query, Tensor cache, Tensor "
       "block_table, Tensor seq_lens, Tensor centroids, Tensor! output) -> ()");
+  m.def(
+      "turboquant_head_parallel_stage1_boundary_b4(Tensor query, Tensor cache, "
+      "Tensor block_table, Tensor seq_lens, Tensor centroids, Tensor! output, "
+      "Tensor table_mismatch) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, m) {
   m.impl("turboquant_head_parallel_stage1",
          TORCH_BOX(&turboquant_head_parallel_stage1));
+  m.impl("turboquant_head_parallel_stage1_boundary_b4",
+         TORCH_BOX(&turboquant_head_parallel_stage1_boundary_b4));
 }

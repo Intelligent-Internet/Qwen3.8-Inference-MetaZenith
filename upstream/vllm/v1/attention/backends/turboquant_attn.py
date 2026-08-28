@@ -542,6 +542,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 PiT,
                 layer,
                 tq_spec_decode_shared=tq_spec_decode_shared,
+                tq_spec_decode_same_request_b4=(_k1 == 4 and _b == 1),
                 direct_output=(
                     output[:N].view(N, self.num_heads, self.head_size)
                     if output.dtype == q.dtype and output.is_contiguous()
@@ -1021,6 +1022,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         PiT: torch.Tensor | None = None,
         layer: torch.nn.Module | None = None,
         tq_spec_decode_shared: bool = False,
+        tq_spec_decode_same_request_b4: bool = False,
         direct_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Acquire shared decode scratch buffers from WorkspaceManager.
@@ -1030,14 +1032,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         D = self.head_size
         S = self.max_num_kv_splits
         Hq = self.num_heads
-        mid_o_buf = output_buf = lse_buf = None
+        mid_o_buf = output_buf = lse_buf = table_mismatch_buf = None
         if is_workspace_manager_initialized():
             # output_buf in query dtype — matches the in-kernel fp16 cast in stage2.
-            mid_o_buf, output_buf, lse_buf = (
+            mid_o_buf, output_buf, lse_buf, table_mismatch_buf = (
                 current_workspace_manager().get_simultaneous(
                     ((B, Hq, S, D + 1), torch.float32),
                     ((B, Hq, D), query.dtype),
                     ((B, Hq), torch.float32),
+                    ((1,), torch.int32),
                 )
             )
         if direct_output is not None:
@@ -1060,6 +1063,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             mid_o_buf=mid_o_buf,
             output_buf=output_buf,
             lse_buf=lse_buf,
+            table_mismatch_buf=table_mismatch_buf,
             buf_holder=layer,
             max_num_kv_splits=self.max_num_kv_splits,
             block_kv=4
@@ -1075,5 +1079,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 )
             ),
             tq_spec_decode_shared=tq_spec_decode_shared,
+            tq_spec_decode_same_request_b4=tq_spec_decode_same_request_b4,
         )
         return result

@@ -1267,6 +1267,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
 
+        # Pure prefill can write the five recurrent-attention inputs directly
+        # from causal conv. Mixed/speculative routes retain the incumbent
+        # materialized-conv path because their token partitions differ.
+        use_fused_gdn_prefill = (
+            attn_metadata.num_prefills > 0
+            and attn_metadata.num_decodes == 0
+            and spec_sequence_masks is None
+            and self.activation in ("silu", "swish")
+            and self.head_k_dim == 128
+            and self.head_v_dim == 128
+            and (self.num_k_heads // self.tp_size) % 2 == 0
+            and (self.num_v_heads // self.tp_size) % 2 == 0
+            and mixed_qkv.dtype == conv_state.dtype
+        )
+        fused_gdn_prefill_outputs = None
+
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
@@ -1292,7 +1308,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
-            mixed_qkv_non_spec = causal_conv1d_fn(
+            conv_result = causal_conv1d_fn(
                 mixed_qkv_non_spec_T,
                 conv_weights,
                 self.conv1d.bias,
@@ -1302,7 +1318,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
                 metadata=attn_metadata,
-            ).transpose(0, 1)
+                gdn_prefill_params=(
+                    a,
+                    b,
+                    self.A_log,
+                    self.dt_bias,
+                    self.num_k_heads // self.tp_size,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
+                if use_fused_gdn_prefill
+                else None,
+            )
+            if use_fused_gdn_prefill:
+                assert isinstance(conv_result, tuple)
+                fused_gdn_prefill_outputs = conv_result
+                mixed_qkv_non_spec = None
+            else:
+                assert isinstance(conv_result, torch.Tensor)
+                mixed_qkv_non_spec = conv_result.transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
             assert mixed_qkv_non_spec is not None
             mixed_qkv_non_spec = causal_conv1d_update(
@@ -1328,43 +1362,52 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_decode_tokens = attn_metadata.num_decode_tokens
 
         if attn_metadata.num_prefills > 0:
-            assert mixed_qkv_non_spec is not None, (
-                "mixed_qkv_non_spec must be provided for prefill path"
-            )
-            if spec_sequence_masks is not None:
-                a_non_spec = a.index_select(0, non_spec_token_indx)
-                b_non_spec = b.index_select(0, non_spec_token_indx)
+            if fused_gdn_prefill_outputs is not None:
+                (
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                ) = fused_gdn_prefill_outputs
             else:
-                a_non_spec = a
-                b_non_spec = b
+                assert mixed_qkv_non_spec is not None, (
+                    "mixed_qkv_non_spec must be provided for prefill path"
+                )
+                if spec_sequence_masks is not None:
+                    a_non_spec = a.index_select(0, non_spec_token_indx)
+                    b_non_spec = b.index_select(0, non_spec_token_indx)
+                else:
+                    a_non_spec = a
+                    b_non_spec = b
 
-            if split_non_spec:
-                conv_output_prefill = mixed_qkv_non_spec[num_decode_tokens:]
-                a_prefill = a_non_spec[num_decode_tokens:]
-                b_prefill = b_non_spec[num_decode_tokens:]
-            else:
-                conv_output_prefill = mixed_qkv_non_spec
-                a_prefill = a_non_spec
-                b_prefill = b_non_spec
+                if split_non_spec:
+                    conv_output_prefill = mixed_qkv_non_spec[num_decode_tokens:]
+                    a_prefill = a_non_spec[num_decode_tokens:]
+                    b_prefill = b_non_spec[num_decode_tokens:]
+                else:
+                    conv_output_prefill = mixed_qkv_non_spec
+                    a_prefill = a_non_spec
+                    b_prefill = b_non_spec
 
-            (
-                query_non_spec,
-                key_non_spec,
-                value_non_spec,
-                g_non_spec,
-                beta_non_spec,
-            ) = fused_post_conv_prep(
-                conv_output=conv_output_prefill,
-                a=a_prefill,
-                b=b_prefill,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                num_k_heads=self.num_k_heads // self.tp_size,
-                head_k_dim=self.head_k_dim,
-                head_v_dim=self.head_v_dim,
-                apply_l2norm=True,
-                output_g_exp=False,
-            )
+                (
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                ) = fused_post_conv_prep(
+                    conv_output=conv_output_prefill,
+                    a=a_prefill,
+                    b=b_prefill,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    num_k_heads=self.num_k_heads // self.tp_size,
+                    head_k_dim=self.head_k_dim,
+                    head_v_dim=self.head_v_dim,
+                    apply_l2norm=True,
+                    output_g_exp=False,
+                )
             query_non_spec = query_non_spec.unsqueeze(0)
             key_non_spec = key_non_spec.unsqueeze(0)
             value_non_spec = value_non_spec.unsqueeze(0)

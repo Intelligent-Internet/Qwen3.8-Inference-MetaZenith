@@ -32,6 +32,17 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     initial_state_idx,  # (batch,)
     num_computed_tokens,  # (batch,)
     o_ptr,  # (dim, seqlen) - actually pointing to x_ptr
+    # Optional GDN-prefill inputs and direct outputs. These are compile-time
+    # dead in the generic causal-conv path.
+    gdn_a_ptr,
+    gdn_b_ptr,
+    gdn_A_log_ptr,
+    gdn_dt_bias_ptr,
+    gdn_q_ptr,
+    gdn_k_ptr,
+    gdn_v_ptr,
+    gdn_g_ptr,
+    gdn_beta_ptr,
     # Matrix dimensions
     dim: tl.constexpr,
     num_cache_lines,  # added to support vLLM larger cache lines
@@ -46,6 +57,11 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     stride_cache_indices: tl.constexpr,
     stride_o_dim: tl.constexpr,
     stride_o_token: tl.int64,
+    stride_gdn_a_token: tl.constexpr,
+    stride_gdn_b_token: tl.constexpr,
+    stride_gdn_q_token: tl.constexpr,
+    stride_gdn_k_token: tl.constexpr,
+    stride_gdn_v_token: tl.constexpr,
     stride_block_m: tl.constexpr,  # Stride block to align divided by BLOCK_M
     # others
     pad_slot_id: tl.constexpr,
@@ -59,6 +75,11 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    FUSE_GDN_PREFILL: tl.constexpr,
+    GDN_QK_DIM: tl.constexpr,
+    GDN_V_DIM: tl.constexpr,
+    GDN_NUM_V_HEADS: tl.constexpr,
+    GDN_HEAD_DIM: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
     conv_states_ptr = initial_states_ptr
@@ -469,13 +490,119 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         mask_1d = (idx_token < segment_len) & (
             idx_feats < dim
         )  # token-index  # feature-index
-        o_ptrs = (
-            o_ptr
-            + (sequence_start_index + token_offset + idx_token) * stride_o_token
-            + (idx_feats * stride_o_dim)
-        )
+        output_token = sequence_start_index + token_offset + idx_token
+        if FUSE_GDN_PREFILL:
+            # Preserve the incumbent materialized-conv rounding point while
+            # writing directly to the post-conv layouts. Q/K are normalized
+            # by a second kernel with the incumbent reduction geometry.
+            rounded = acc.to(gdn_q_ptr.dtype.element_ty)
+            feature_block = tl.program_id(1)
+            QK_BLOCKS: tl.constexpr = GDN_QK_DIM // BLOCK_N
+            HEADS_PER_BLOCK: tl.constexpr = BLOCK_N // GDN_HEAD_DIM
 
-        tl.store(o_ptrs, acc, mask=mask_1d)
+            if feature_block < QK_BLOCKS:
+                q_ptrs = (
+                    gdn_q_ptr
+                    + output_token * stride_gdn_q_token
+                    + idx_feats
+                )
+                tl.store(q_ptrs, rounded, mask=mask_1d)
+            elif feature_block < 2 * QK_BLOCKS:
+                k_feature = idx_feats - GDN_QK_DIM
+                k_ptrs = (
+                    gdn_k_ptr
+                    + output_token * stride_gdn_k_token
+                    + k_feature
+                )
+                tl.store(k_ptrs, rounded, mask=mask_1d)
+            else:
+                v_feature = idx_feats - 2 * GDN_QK_DIM
+                v_ptrs = (
+                    gdn_v_ptr
+                    + output_token * stride_gdn_v_token
+                    + v_feature
+                )
+                tl.store(v_ptrs, rounded, mask=mask_1d)
+
+                head_base = (feature_block - 2 * QK_BLOCKS) * HEADS_PER_BLOCK
+                for local_head in tl.static_range(HEADS_PER_BLOCK):
+                    head = head_base + local_head
+                    head_mask = head < GDN_NUM_V_HEADS
+                    a_value = tl.load(
+                        gdn_a_ptr + output_token * stride_gdn_a_token + head,
+                        mask=head_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    b_value = tl.load(
+                        gdn_b_ptr + output_token * stride_gdn_b_token + head,
+                        mask=head_mask,
+                        other=0.0,
+                    ).to(tl.float32)
+                    A_log_value = tl.load(
+                        gdn_A_log_ptr + head, mask=head_mask, other=0.0
+                    ).to(tl.float32)
+                    dt_bias_value = tl.load(
+                        gdn_dt_bias_ptr + head, mask=head_mask, other=0.0
+                    ).to(tl.float32)
+                    z = a_value + dt_bias_value
+                    softplus = tl.where(
+                        z > 0,
+                        z + tl.log(1.0 + tl.exp(-z)),
+                        tl.log(1.0 + tl.exp(z)),
+                    )
+                    softplus = tl.where(z <= 20.0, softplus, z)
+                    gate = -tl.exp(A_log_value) * softplus
+                    gb_offset = output_token * GDN_NUM_V_HEADS + head
+                    tl.store(gdn_g_ptr + gb_offset, gate, mask=head_mask)
+                    tl.store(
+                        gdn_beta_ptr + gb_offset,
+                        tl.sigmoid(b_value),
+                        mask=head_mask,
+                    )
+        else:
+            o_ptrs = (
+                o_ptr
+                + output_token * stride_o_token
+                + (idx_feats * stride_o_dim)
+            )
+            tl.store(o_ptrs, acc, mask=mask_1d)
+
+
+@triton.jit
+def _gdn_qk_l2norm_inplace_kernel(
+    q_ptr,
+    k_ptr,
+    stride_q_token,
+    stride_k_token,
+    L,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """Normalize raw GDN Q/K with the incumbent post-conv reduction layout."""
+    token_block = tl.program_id(0)
+    head = tl.program_id(1)
+    offs_t = token_block * BLOCK_T + tl.arange(0, BLOCK_T)
+    mask_t = offs_t < L
+    offs_k = tl.arange(0, BK)
+    mask_k = offs_k < K
+    mask = mask_t[:, None] & mask_k[None, :]
+
+    q_offsets = offs_t[:, None] * stride_q_token + head * K + offs_k[None, :]
+    k_offsets = offs_t[:, None] * stride_k_token + head * K + offs_k[None, :]
+    q_f32 = tl.load(q_ptr + q_offsets, mask=mask, other=0).to(tl.float32)
+    k_f32 = tl.load(k_ptr + k_offsets, mask=mask, other=0).to(tl.float32)
+
+    q_sq_sum = tl.sum(q_f32 * q_f32, axis=1)
+    q_inv = 1.0 / tl.sqrt(q_sq_sum + 1e-6)
+    q_f32 = q_f32 * q_inv[:, None]
+    k_sq_sum = tl.sum(k_f32 * k_f32, axis=1)
+    k_inv = 1.0 / tl.sqrt(k_sq_sum + 1e-6)
+    k_f32 = k_f32 * k_inv[:, None]
+
+    tl.store(q_ptr + q_offsets, q_f32.to(q_ptr.dtype.element_ty), mask=mask)
+    tl.store(k_ptr + k_offsets, k_f32.to(k_ptr.dtype.element_ty), mask=mask)
 
 
 def causal_conv1d_fn(
@@ -496,6 +623,16 @@ def causal_conv1d_fn(
     block_size_to_align=0,
     metadata=None,
     validate_data=False,
+    gdn_prefill_params: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        int,
+        int,
+    ]
+    | None = None,
 ):
     """support varlen + continuous batching when x is 2D tensor
 
@@ -555,7 +692,41 @@ def causal_conv1d_fn(
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
-    out = torch.empty_like(x)
+    dim, cu_seqlen = x.shape
+    fuse_gdn_prefill = gdn_prefill_params is not None
+    if fuse_gdn_prefill:
+        assert gdn_prefill_params is not None
+        gdn_a, gdn_b, gdn_A_log, gdn_dt_bias, gdn_h, gdn_k, gdn_v = (
+            gdn_prefill_params
+        )
+        gdn_hv = gdn_A_log.shape[0]
+        gdn_qk_dim = gdn_h * gdn_k
+        gdn_v_dim = gdn_hv * gdn_v
+        assert original_x_dtype == x.dtype
+        assert gdn_k == 128 and gdn_v == 128
+        assert dim == 2 * gdn_qk_dim + gdn_v_dim
+        assert gdn_a.shape == (cu_seqlen, gdn_hv)
+        assert gdn_b.shape == (cu_seqlen, gdn_hv)
+        gdn_q_out = torch.empty(
+            (cu_seqlen, gdn_h, gdn_k), dtype=x.dtype, device=x.device
+        )
+        gdn_k_out = torch.empty_like(gdn_q_out)
+        gdn_v_out = torch.empty(
+            (cu_seqlen, gdn_hv, gdn_v), dtype=x.dtype, device=x.device
+        )
+        gdn_g_out = torch.empty(
+            (cu_seqlen, gdn_hv), dtype=torch.float32, device=x.device
+        )
+        gdn_beta_out = torch.empty_like(gdn_g_out)
+        # o_ptr is compile-time dead in fused mode; retain a valid channel-last
+        # placeholder so the generic launch geometry and state logic stay shared.
+        out = gdn_q_out.view(cu_seqlen, -1).transpose(0, 1)
+    else:
+        out = torch.empty_like(x)
+        # Valid dummy pointers for arguments eliminated by FUSE_GDN_PREFILL=False.
+        gdn_a = gdn_b = gdn_A_log = gdn_dt_bias = x
+        gdn_q_out = gdn_k_out = gdn_v_out = gdn_g_out = gdn_beta_out = out
+        gdn_h = gdn_hv = gdn_k = gdn_v = gdn_qk_dim = gdn_v_dim = 0
     if metadata is not None:
         nums_dict = metadata.nums_dict
         args = nums_dict
@@ -574,7 +745,6 @@ def causal_conv1d_fn(
         )  # tracking BLOCK_M-based index in the sequence the Triton program is handling
 
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
-    dim, cu_seqlen = x.shape
     _, width = weight.shape
     state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
@@ -611,6 +781,11 @@ def causal_conv1d_fn(
         stride_o_dim = out.stride(1)
         stride_o_token = out.stride(2)
     stride_cache_indices = cache_indices.stride(0) if cache_indices is not None else 0
+    stride_gdn_a_token = gdn_a.stride(0) if fuse_gdn_prefill else 0
+    stride_gdn_b_token = gdn_b.stride(0) if fuse_gdn_prefill else 0
+    stride_gdn_q_token = gdn_q_out.stride(0) if fuse_gdn_prefill else 0
+    stride_gdn_k_token = gdn_k_out.stride(0) if fuse_gdn_prefill else 0
+    stride_gdn_v_token = gdn_v_out.stride(0) if fuse_gdn_prefill else 0
 
     if validate_data:
         assert x.dim() == 2
@@ -725,6 +900,15 @@ def causal_conv1d_fn(
         initial_state_idx,
         num_computed_tokens,
         out,
+        gdn_a,
+        gdn_b,
+        gdn_A_log,
+        gdn_dt_bias,
+        gdn_q_out,
+        gdn_k_out,
+        gdn_v_out,
+        gdn_g_out,
+        gdn_beta_out,
         # Matrix dimensions
         dim,
         num_cache_lines,
@@ -739,6 +923,11 @@ def causal_conv1d_fn(
         stride_cache_indices,
         stride_o_dim,
         stride_o_token,
+        stride_gdn_a_token,
+        stride_gdn_b_token,
+        stride_gdn_q_token,
+        stride_gdn_k_token,
+        stride_gdn_v_token,
         block_size_to_align // BLOCK_M,
         # others
         pad_slot_id,
@@ -753,9 +942,31 @@ def causal_conv1d_fn(
         # launch_cooperative_grid=True
         BLOCK_M=BLOCK_M,
         BLOCK_N=256,
+        FUSE_GDN_PREFILL=fuse_gdn_prefill,
+        GDN_QK_DIM=gdn_qk_dim,
+        GDN_V_DIM=gdn_v_dim,
+        GDN_NUM_V_HEADS=gdn_hv,
+        GDN_HEAD_DIM=gdn_v,
         num_stages=2,
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
+    if fuse_gdn_prefill:
+        _gdn_qk_l2norm_inplace_kernel[
+            (triton.cdiv(cu_seqlen, 16), gdn_h)
+        ](
+            gdn_q_out,
+            gdn_k_out,
+            gdn_q_out.stride(0),
+            gdn_k_out.stride(0),
+            cu_seqlen,
+            H=gdn_h,
+            K=gdn_k,
+            BLOCK_T=16,
+            BK=128,
+            num_warps=4,
+            num_stages=2,
+        )
+        return gdn_q_out, gdn_k_out, gdn_v_out, gdn_g_out, gdn_beta_out
     return out.to(original_x_dtype)
 
 

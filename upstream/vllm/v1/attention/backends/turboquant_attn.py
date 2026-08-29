@@ -82,7 +82,7 @@ TURBOQUANT_FULL_CUDAGRAPH_MAX_SEQ_LENS = (
 )
 TURBOQUANT_SPEC_DECODE_NUM_SPLITS = 32
 TURBOQUANT_SPEC_NUM_KV_HEADS = 4
-TURBOQUANT_SPEC_SLOT_SIZE_BYTES = 262
+TURBOQUANT_SPEC_SLOT_SIZE_BYTES = 268
 TURBOQUANT_SPEC_PAIR_MIN_KV_BYTES = 90 * 1024 * 1024
 
 
@@ -700,6 +700,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             key_packed_size=self.tq_config.key_packed_size,
             value_quant_bits=self.tq_config.effective_value_quant_bits,
             key_fp8=self.tq_config.key_fp8,
+            centroids=layer._tq_centroids,
         )
 
     # ------------------------------------------------------------------ #

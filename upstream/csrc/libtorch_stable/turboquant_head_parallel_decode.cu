@@ -17,7 +17,7 @@ constexpr int kNumQueryHeads = 24;
 constexpr int kNumKvHeads = 4;
 constexpr int kHeadDim = 256;
 constexpr int kBlockSize = 16;
-constexpr int kSlotSize = 262;
+constexpr int kSlotSize = 268;
 constexpr int kNumSplits = 32;
 constexpr int kHeadWarps = 3;
 constexpr int kHeadsPerWarp = 2;
@@ -51,12 +51,6 @@ __device__ __forceinline__ float triton_exp(float value) {
   const float scaled = value * 1.4426950408889634074f;
   float result;
   asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(scaled));
-  return result;
-}
-
-__device__ __forceinline__ float triton_sqrt(float value) {
-  float result;
-  asm("sqrt.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
   return result;
 }
 
@@ -158,14 +152,8 @@ __global__ void turboquant_head_parallel_stage1_kernel(
       value_part[i] = value_idx * value_scale + value_zero;
     }
 
-    float norm_terms[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      norm_terms[i] = key_part[i] * key_part[i];
-    }
-    const float norm_sq = warp_sum(lane_reduce8(norm_terms));
     const float inv_norm =
-        triton_div(1.0f, triton_sqrt(norm_sq + 1.0e-16f));
+        valid ? *reinterpret_cast<const float*>(slot + 264) : 0.0f;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
       const int d = lane + i * 32;
@@ -274,24 +262,10 @@ __global__ void turboquant_head_parallel_stage1_pipeline_kernel(
   const int loader_token = warp - kHeadWarps;
 
   // Complement the synthetic-row shared kernel.  The preceding proof launch
-  // covers every active page, and the four authoritative device lengths cover
-  // graph-time corrections.  Every CTA therefore makes the same decision.
-  __shared__ int share_safe;
+  // folds physical-page identity and authoritative split width into one
+  // immutable stream-ordered flag, so every thread makes the same decision.
   if constexpr (kBoundaryOnly) {
-    if (threadIdx.x == 0) {
-      const int common_len = (seq_lens[0] + kNumSplits - 1) / kNumSplits;
-      share_safe = table_mismatch[0] == 0;
-#pragma unroll
-      for (int other_row = 1; other_row < 4; ++other_row) {
-        const int candidate =
-            (seq_lens[other_row] + kNumSplits - 1) / kNumSplits;
-        if (candidate != common_len) {
-          share_safe = 0;
-        }
-      }
-    }
-    __syncthreads();
-    if (share_safe) {
+    if (table_mismatch[0] == 0) {
       return;
     }
   }
@@ -369,14 +343,8 @@ __global__ void turboquant_head_parallel_stage1_pipeline_kernel(
       value_part[i] = value_idx * value_scale + value_zero;
     }
 
-    float norm_terms[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      norm_terms[i] = key_part[i] * key_part[i];
-    }
-    const float norm_sq = warp_sum(lane_reduce8(norm_terms));
     const float inv_norm =
-        triton_div(1.0f, triton_sqrt(norm_sq + 1.0e-16f));
+        valid ? *reinterpret_cast<const float*>(slot + 264) : 0.0f;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
       const int d = lane + i * 32;

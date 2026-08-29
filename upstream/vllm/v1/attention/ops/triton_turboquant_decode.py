@@ -808,7 +808,7 @@ def triton_turboquant_decode_attention(
         and use_head_parallel_stage1
         and NUM_KV_SPLITS == 32
         and block_size == 16
-        and kv_cache.shape[3] == 262
+        and kv_cache.shape[3] == 268
         and scale == 0.0625
     )
     use_tq_spec_decode_shared = (
@@ -817,7 +817,7 @@ def triton_turboquant_decode_attention(
         and current_platform.is_cuda()
         and B in (8, 16)
         and block_size == 16
-        and kv_cache.shape[3] == 262
+        and kv_cache.shape[3] == 268
         and NUM_KV_SPLITS == 32
         and scale == 0.0625
     )

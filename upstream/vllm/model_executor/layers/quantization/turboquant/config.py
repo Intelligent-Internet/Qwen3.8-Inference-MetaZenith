@@ -171,6 +171,18 @@ class TurboQuantConfig:
         is integral.
         """
         s = self.slot_size
+        # The exact native 256D MSE4/value4 norm-correction decoder reuses an
+        # immutable FP32 inverse norm derived from the packed centroid key.
+        # Keep the original 262-byte payload intact, align the metadata, and
+        # append four bytes. Other TurboQuant layouts retain their ABI.
+        if (
+            self.head_dim == 256
+            and not self.key_fp8
+            and self.key_mse_bits == 4
+            and self.effective_value_quant_bits == 4
+            and self.norm_correction
+        ):
+            return ((s + 3) // 4) * 4 + 4
         return s + (s % 2)  # round up to even
 
     @staticmethod

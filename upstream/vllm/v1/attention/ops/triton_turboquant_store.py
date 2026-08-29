@@ -225,6 +225,7 @@ def _tq_fused_store_mse(
     Value_ptr,  # [N, H, D] BF16 — raw values
     # Quantization tables
     Midpoints_ptr,  # [n_centroids-1] float32
+    Centroids_ptr,  # [n_centroids] float32
     # Cache and indexing
     KV_cache_ptr,  # [total_bytes] uint8 (flattened view)
     Slot_mapping_ptr,  # [N] int32 — per-token slot indices
@@ -250,6 +251,7 @@ def _tq_fused_store_mse(
     # MSE params
     MSE_BITS: tl.constexpr,
     N_CENTROIDS: tl.constexpr,
+    CACHE_INV_NORM: tl.constexpr,
     BLOCK_GRP: tl.constexpr = 16,
 ):
     """Fused MSE quantize + pack + store.
@@ -344,6 +346,31 @@ def _tq_fused_store_mse(
         BLOCK_GRP=BLOCK_GRP,
     )
 
+    if CACHE_INV_NORM:
+        # Decode consumes the packed indices, so derive its immutable inverse
+        # norm from those exact bytes. The CTA barrier orders key-byte stores
+        # across the four Triton warps before the one-warp reduction reads.
+        # This explicit tree matches the incumbent [2, 256] decoder reduction:
+        # a left fold over d=lane+32*k, followed by the 32-lane warp sum.
+        tl.debug_barrier()
+        lane = tl.arange(0, 32)
+        lane_sum = tl.zeros([32], dtype=tl.float32)
+        for k in range(8):
+            dim = lane + k * 32
+            key_byte = tl.load(KV_cache_ptr + slot_base + dim // 2).to(tl.int32)
+            key_idx = (key_byte >> ((dim & 1) * 4)) & 15
+            reconstructed = tl.load(Centroids_ptr + key_idx).to(tl.float32)
+            term = reconstructed * reconstructed
+            lane_sum = term if k == 0 else lane_sum + term
+        reconstructed_norm_sq = tl.sum(lane_sum, axis=0)
+        cached_inv_norm = 1.0 / tl.sqrt(reconstructed_norm_sq + 1.0e-16)
+        inv_bits = cached_inv_norm.to(tl.uint32, bitcast=True)
+        for byte_index in range(4):
+            tl.store(
+                KV_cache_ptr + slot_base + 264 + byte_index,
+                ((inv_bits >> (byte_index * 8)) & 0xFF).to(tl.uint8),
+            )
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Launcher
@@ -361,6 +388,7 @@ def triton_turboquant_store(
     key_packed_size: int,
     value_quant_bits: int,
     key_fp8: bool = False,
+    centroids: torch.Tensor | None = None,  # [n_centroids] float32
 ):
     """Launch TQ store kernel (FP8 or MSE path)."""
     N, H, D = key.shape
@@ -419,6 +447,19 @@ def triton_turboquant_store(
     x_hat = key / (norms + 1e-8)
     y = x_hat.reshape(NH, D) @ PiT
 
+    cache_inv_norm = (
+        D == 256
+        and H == 4
+        and mse_bits == 4
+        and value_quant_bits == 4
+        and kv_cache.shape[3] == 268
+    )
+    if cache_inv_norm:
+        assert centroids is not None, (
+            "the specialized 268-byte TurboQuant layout requires centroids"
+        )
+    centroid_table = centroids if centroids is not None else midpoints
+
     # Fused kernel: bucketize + MSE index pack + norm store + value pack
     grid = (NH,)
     _tq_fused_store_mse[grid](
@@ -426,6 +467,7 @@ def triton_turboquant_store(
         norms.reshape(NH),
         value,
         midpoints,
+        centroid_table,
         kv_cache,
         slot_mapping,
         stride_cache_block=stride_block,
@@ -444,6 +486,7 @@ def triton_turboquant_store(
         BLOCK_VAL=BLOCK_VAL,
         MSE_BITS=mse_bits,
         N_CENTROIDS=n_centroids,
+        CACHE_INV_NORM=cache_inv_norm,
         BLOCK_GRP=block_grp,
         num_warps=4,
         num_stages=1,

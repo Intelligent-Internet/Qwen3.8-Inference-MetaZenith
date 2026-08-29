@@ -16,7 +16,7 @@ constexpr int kKvHeads = 4;
 constexpr int kHeadsPerKv = 6;
 constexpr int kHeadDim = 256;
 constexpr int kBlockSize = 16;
-constexpr int kSlotSize = 262;
+constexpr int kSlotSize = 268;
 constexpr int kSplits = 32;
 constexpr float kAttentionScale = 0.0625f;
 
@@ -49,12 +49,6 @@ __device__ __forceinline__ float tq_exp(float value) {
   const float scaled = value * 1.4426950408889634074f;
   float result;
   asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(scaled));
-  return result;
-}
-
-__device__ __forceinline__ float tq_sqrt(float value) {
-  float result;
-  asm("sqrt.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
   return result;
 }
 
@@ -172,13 +166,8 @@ __global__ __launch_bounds__(128, 2) void turboquant_shared_rows_stage1_kernel(
         value_part[k] = value_idx * value_scale + value_zero;
       }
 
-      float norm_terms[8];
-#pragma unroll
-      for (int k = 0; k < 8; ++k) {
-        norm_terms[k] = key_part[k] * key_part[k];
-      }
-      const float norm_sq = warp_sum(lane_reduce8(norm_terms));
-      const float inv_norm = tq_div(1.0f, tq_sqrt(norm_sq + 1.0e-16f));
+      const float inv_norm =
+          valid ? *reinterpret_cast<const float*>(slot + 264) : 0.0f;
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
         const int d = lane + k * 32;
@@ -357,13 +346,8 @@ void turboquant_shared_rows_tile20_stage1_kernel(
         value_part[k] = value_idx * value_scale + value_zero;
       }
 
-      float norm_terms[8];
-#pragma unroll
-      for (int k = 0; k < 8; ++k) {
-        norm_terms[k] = key_part[k] * key_part[k];
-      }
-      const float norm_sq = warp_sum(lane_reduce8(norm_terms));
-      const float inv_norm = tq_div(1.0f, tq_sqrt(norm_sq + 1.0e-16f));
+      const float inv_norm =
+          valid ? *reinterpret_cast<const float*>(slot + 264) : 0.0f;
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
         const int d = lane + k * 32;
@@ -478,27 +462,11 @@ void turboquant_shared4_grid3_pipeline_kernel(
   const int loader_warp = warp - kComputeWarps;
   const int batch = group * kRows + row;
 
-  // This B4 specialization is selected only for four synthetic verification
-  // rows whose physical block table is repeated from one request.  Async MTP
-  // may still correct the authoritative lengths after graph dispatch, so
-  // prove on device that all rows retain one common 32-way split width.  The
-  // complementary head-parallel launch handles the boundary case exactly.
-  __shared__ int share_safe;
-  if (threadIdx.x == 0) {
-    const int common_len =
-        (seq[group * kRows] + kSplits - 1) / kSplits;
-    share_safe = table_mismatch[0] == 0;
-#pragma unroll
-    for (int other_row = 1; other_row < kRows; ++other_row) {
-      const int candidate =
-          (seq[group * kRows + other_row] + kSplits - 1) / kSplits;
-      if (candidate != common_len) {
-        share_safe = 0;
-      }
-    }
-  }
-  __syncthreads();
-  if (!share_safe) {
+  // The preceding stream-ordered proof covers both physical block identity
+  // and authoritative split width.  Its immutable flag makes this predicate
+  // uniform across the CTA; the complementary head-parallel kernel handles
+  // every failed proof exactly.
+  if (table_mismatch[0] != 0) {
     return;
   }
 
@@ -596,14 +564,8 @@ void turboquant_shared4_grid3_pipeline_kernel(
             (value_byte >> ((d & 1) * 4)) & 15);
         value_part[k] = value_idx * value_scale + value_zero;
       }
-      float norm_terms[8];
-#pragma unroll
-      for (int k = 0; k < 8; ++k) {
-        norm_terms[k] = key_part[k] * key_part[k];
-      }
-      const float norm_sq = warp_sum(lane_reduce8(norm_terms));
       const float inv_norm =
-          tq_div(1.0f, tq_sqrt(norm_sq + 1.0e-16f));
+          valid ? *reinterpret_cast<const float*>(slot + 264) : 0.0f;
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
         const int d = lane + k * 32;
@@ -712,6 +674,15 @@ __global__ void turboquant_b4_table_identity_proof_kernel(
 #pragma unroll
   for (int row = 0; row < 4; ++row) {
     max_seq = max(max_seq, seq[row]);
+  }
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    const int common_split_len = (seq[0] + kSplits - 1) / kSplits;
+#pragma unroll
+    for (int row = 1; row < 4; ++row) {
+      if ((seq[row] + kSplits - 1) / kSplits != common_split_len) {
+        atomicExch(mismatch, 1);
+      }
+    }
   }
   const int active_pages = (max_seq + kBlockSize - 1) / kBlockSize;
   if (threadIdx.x == 0 && blockIdx.x == 0 && active_pages > table_stride) {

@@ -442,6 +442,18 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
 
+    if FUSE_GDN_PREFILL:
+        feature_block = tl.program_id(1)
+        QK_BLOCKS: tl.constexpr = GDN_QK_DIM // BLOCK_N
+        HEADS_PER_BLOCK: tl.constexpr = BLOCK_N // GDN_HEAD_DIM
+        # One conv program owns 8 tokens x 2 Q/K heads. Keeping this tile in
+        # BF16 preserves the incumbent materialized-conv rounding point. It is
+        # reloaded below with the exact 16x128 reduction layout of the removed
+        # post-conv normalization kernel.
+        qk_tile = tl.zeros(
+            (BLOCK_M, BLOCK_N), dtype=gdn_q_ptr.dtype.element_ty
+        )
+
     for idx_token in range(segment_len):
         acc = acc_preload
 
@@ -493,28 +505,21 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         output_token = sequence_start_index + token_offset + idx_token
         if FUSE_GDN_PREFILL:
             # Preserve the incumbent materialized-conv rounding point while
-            # writing directly to the post-conv layouts. Q/K are normalized
-            # by a second kernel with the incumbent reduction geometry.
+            # writing directly to the post-conv layouts.
             rounded = acc.to(gdn_q_ptr.dtype.element_ty)
-            feature_block = tl.program_id(1)
-            QK_BLOCKS: tl.constexpr = GDN_QK_DIM // BLOCK_N
-            HEADS_PER_BLOCK: tl.constexpr = BLOCK_N // GDN_HEAD_DIM
 
             if feature_block < QK_BLOCKS:
-                q_ptrs = (
-                    gdn_q_ptr
-                    + output_token * stride_gdn_q_token
-                    + idx_feats
+                qk_tile = tl.where(
+                    (tl.arange(0, BLOCK_M) == idx_token)[:, None],
+                    rounded[None, :],
+                    qk_tile,
                 )
-                tl.store(q_ptrs, rounded, mask=mask_1d)
             elif feature_block < 2 * QK_BLOCKS:
-                k_feature = idx_feats - GDN_QK_DIM
-                k_ptrs = (
-                    gdn_k_ptr
-                    + output_token * stride_gdn_k_token
-                    + k_feature
+                qk_tile = tl.where(
+                    (tl.arange(0, BLOCK_M) == idx_token)[:, None],
+                    rounded[None, :],
+                    qk_tile,
                 )
-                tl.store(k_ptrs, rounded, mask=mask_1d)
             else:
                 v_feature = idx_feats - 2 * GDN_QK_DIM
                 v_ptrs = (
@@ -566,6 +571,83 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 + (idx_feats * stride_o_dim)
             )
             tl.store(o_ptrs, acc, mask=mask_1d)
+
+    if FUSE_GDN_PREFILL:
+        if feature_block < 2 * QK_BLOCKS:
+            tile_tokens = sequence_start_index + token_offset + tl.arange(0, BLOCK_M)
+            tile_mask = (
+                (tl.arange(0, BLOCK_M) < segment_len)[:, None]
+                & (idx_feats < dim)[None, :]
+            )
+            norm_rows = tl.arange(0, BLOCK_M * HEADS_PER_BLOCK)
+            norm_dims = tl.arange(0, GDN_HEAD_DIM)
+            norm_mask = (
+                (norm_rows // HEADS_PER_BLOCK < segment_len)[:, None]
+                & (norm_dims < GDN_HEAD_DIM)[None, :]
+            )
+            if feature_block < QK_BLOCKS:
+                q_raw_ptrs = (
+                    gdn_q_ptr
+                    + tile_tokens[:, None] * stride_gdn_q_token
+                    + idx_feats[None, :]
+                )
+                tl.store(q_raw_ptrs, qk_tile, mask=tile_mask)
+                tl.debug_barrier()
+                q_head_base = feature_block * HEADS_PER_BLOCK
+                q_norm_ptrs = (
+                    gdn_q_ptr
+                    + (
+                        sequence_start_index
+                        + token_offset
+                        + norm_rows // HEADS_PER_BLOCK
+                    )[:, None]
+                    * stride_gdn_q_token
+                    + (q_head_base + norm_rows % HEADS_PER_BLOCK)[:, None]
+                    * GDN_HEAD_DIM
+                    + norm_dims[None, :]
+                )
+                q_f32 = tl.load(q_norm_ptrs, mask=norm_mask, other=0.0).to(
+                    tl.float32
+                )
+                q_sq_sum = tl.sum(q_f32 * q_f32, axis=1)
+                q_inv = 1.0 / tl.sqrt(q_sq_sum + 1e-6)
+                tl.store(
+                    q_norm_ptrs,
+                    (q_f32 * q_inv[:, None]).to(gdn_q_ptr.dtype.element_ty),
+                    mask=norm_mask,
+                )
+            else:
+                k_feature = idx_feats - GDN_QK_DIM
+                k_raw_ptrs = (
+                    gdn_k_ptr
+                    + tile_tokens[:, None] * stride_gdn_k_token
+                    + k_feature[None, :]
+                )
+                tl.store(k_raw_ptrs, qk_tile, mask=tile_mask)
+                tl.debug_barrier()
+                k_head_base = (feature_block - QK_BLOCKS) * HEADS_PER_BLOCK
+                k_norm_ptrs = (
+                    gdn_k_ptr
+                    + (
+                        sequence_start_index
+                        + token_offset
+                        + norm_rows // HEADS_PER_BLOCK
+                    )[:, None]
+                    * stride_gdn_k_token
+                    + (k_head_base + norm_rows % HEADS_PER_BLOCK)[:, None]
+                    * GDN_HEAD_DIM
+                    + norm_dims[None, :]
+                )
+                k_f32 = tl.load(k_norm_ptrs, mask=norm_mask, other=0.0).to(
+                    tl.float32
+                )
+                k_sq_sum = tl.sum(k_f32 * k_f32, axis=1)
+                k_inv = 1.0 / tl.sqrt(k_sq_sum + 1e-6)
+                tl.store(
+                    k_norm_ptrs,
+                    (k_f32 * k_inv[:, None]).to(gdn_k_ptr.dtype.element_ty),
+                    mask=norm_mask,
+                )
 
 
 @triton.jit
@@ -951,21 +1033,6 @@ def causal_conv1d_fn(
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
     if fuse_gdn_prefill:
-        _gdn_qk_l2norm_inplace_kernel[
-            (triton.cdiv(cu_seqlen, 16), gdn_h)
-        ](
-            gdn_q_out,
-            gdn_k_out,
-            gdn_q_out.stride(0),
-            gdn_k_out.stride(0),
-            cu_seqlen,
-            H=gdn_h,
-            K=gdn_k,
-            BLOCK_T=16,
-            BK=128,
-            num_warps=4,
-            num_stages=2,
-        )
         return gdn_q_out, gdn_k_out, gdn_v_out, gdn_g_out, gdn_beta_out
     return out.to(original_x_dtype)
 

@@ -6,6 +6,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cstdint>
 #include <torch/csrc/stable/library.h>
 
 namespace vllm {
@@ -42,6 +43,14 @@ __device__ __forceinline__ float unpack_half(const uint8_t* ptr) {
   raw.x = static_cast<unsigned short>(ptr[0]) |
           (static_cast<unsigned short>(ptr[1]) << 8);
   return __half2float(raw);
+}
+
+__device__ __forceinline__ float unpack_float_unaligned(const uint8_t* ptr) {
+  const std::uint32_t bits = static_cast<std::uint32_t>(ptr[0]) |
+      (static_cast<std::uint32_t>(ptr[1]) << 8) |
+      (static_cast<std::uint32_t>(ptr[2]) << 16) |
+      (static_cast<std::uint32_t>(ptr[3]) << 24);
+  return __uint_as_float(bits);
 }
 
 // Match the PTX operations emitted by the existing Triton stage-1 kernel.
@@ -434,7 +443,9 @@ void turboquant_shared_rows_tile20_stage1_kernel(
 // retain target parallelism while sharing historical KV across four causal rows.
 template <int kTileTokens = 20, int kLoaderWarps = 5,
           int kHeadsPerWarp = 6, int kHeadGroups = 1,
-          int kActiveSplits = kSplits>
+          int kActiveSplits = kSplits,
+          bool kVectorPackedLoads = false,
+          bool kUnalignedCachedNorm = false>
 __global__ __launch_bounds__((4 + kLoaderWarps) * 32,
                              kHeadGroups == 1 ? 1 : 2)
 void turboquant_shared4_grid3_pipeline_kernel(
@@ -446,6 +457,7 @@ void turboquant_shared4_grid3_pipeline_kernel(
     const int* __restrict__ table_mismatch) {
   constexpr int kRows = 4;
   constexpr int kComputeWarps = kRows;
+  static_assert(!(kVectorPackedLoads && kUnalignedCachedNorm));
   static_assert(6 % kHeadsPerWarp == 0);
   static_assert(kHeadGroups == 1 ||
                 kHeadGroups * kHeadsPerWarp == 6);
@@ -553,22 +565,48 @@ void turboquant_shared4_grid3_pipeline_kernel(
       const float value_zero = valid ? unpack_half(slot + 260) : 0.0f;
       float key_part[8];
       float value_part[8];
+      std::uint32_t packed_key_word = 0;
+      std::uint32_t packed_value_word = 0;
+      if constexpr (kVectorPackedLoads) {
+        if (valid) {
+          // A normal slot base is four-byte aligned.  The value payload starts
+          // at byte 130, so combine two naturally aligned 16-bit loads rather
+          // than issuing an unaligned 32-bit access.
+          packed_key_word = *reinterpret_cast<const std::uint32_t*>(
+              slot + lane * 4);
+          const std::uint16_t value_lo =
+              *reinterpret_cast<const std::uint16_t*>(
+                  slot + 130 + lane * 4);
+          const std::uint16_t value_hi =
+              *reinterpret_cast<const std::uint16_t*>(
+                  slot + 132 + lane * 4);
+          packed_value_word = static_cast<std::uint32_t>(value_lo) |
+              (static_cast<std::uint32_t>(value_hi) << 16);
+        }
+      }
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
-        const int d = lane + k * 32;
-        const uint8_t key_byte = valid ? slot[d >> 1] : 0;
+        const int d = kVectorPackedLoads ? lane * 8 + k : lane + k * 32;
+        const uint8_t key_byte = kVectorPackedLoads
+            ? static_cast<uint8_t>(packed_key_word >> ((k >> 1) * 8))
+            : (valid ? slot[d >> 1] : 0);
         const int key_idx = (key_byte >> ((d & 1) * 4)) & 15;
         key_part[k] = valid ? centroids[key_idx] : 0.0f;
-        const uint8_t value_byte = valid ? slot[130 + (d >> 1)] : 0;
+        const uint8_t value_byte = kVectorPackedLoads
+            ? static_cast<uint8_t>(packed_value_word >> ((k >> 1) * 8))
+            : (valid ? slot[130 + (d >> 1)] : 0);
         const float value_idx = static_cast<float>(
             (value_byte >> ((d & 1) * 4)) & 15);
         value_part[k] = value_idx * value_scale + value_zero;
       }
-      const float inv_norm =
-          valid ? *reinterpret_cast<const float*>(slot + 264) : 0.0f;
+      const float inv_norm = valid
+          ? (kUnalignedCachedNorm
+                 ? unpack_float_unaligned(slot + 264)
+                 : *reinterpret_cast<const float*>(slot + 264))
+          : 0.0f;
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
-        const int d = lane + k * 32;
+        const int d = kVectorPackedLoads ? lane * 8 + k : lane + k * 32;
         shared_key[buffer][loader_token][d] = key_part[k] * inv_norm;
         shared_value[buffer][loader_token][d] = value_part[k];
       }
@@ -771,8 +809,21 @@ void turboquant_shared_rows_stage1(const torch::stable::Tensor& query,
     cudaMemsetAsync(table_mismatch.mutable_data_ptr<int>(), 0, sizeof(int),
                     stream);
     if (active_splits == 28) {
-      const auto kernel = turboquant_shared4_grid3_pipeline_kernel<
-          kTileTokens, kLoaderWarps, kHeadsPerWarp, kHeadGroups, 28>;
+      constexpr std::uintptr_t kPackedAlignment = alignof(std::uint32_t);
+      const bool vector_load_compatible =
+          reinterpret_cast<std::uintptr_t>(
+              cache.const_data_ptr<uint8_t>()) % kPackedAlignment == 0 &&
+          cache.stride(0) % kPackedAlignment == 0 &&
+          cache.stride(1) % kPackedAlignment == 0 &&
+          cache.stride(2) % kPackedAlignment == 0;
+      const auto scalar_kernel = turboquant_shared4_grid3_pipeline_kernel<
+          kTileTokens, kLoaderWarps, kHeadsPerWarp, kHeadGroups, 28, false,
+          true>;
+      const auto vector_kernel = turboquant_shared4_grid3_pipeline_kernel<
+          kTileTokens, kLoaderWarps, kHeadsPerWarp, kHeadGroups, 28, true,
+          false>;
+      const auto kernel =
+          vector_load_compatible ? vector_kernel : scalar_kernel;
       const cudaError_t attr_error = cudaFuncSetAttribute(
           kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);
       STD_TORCH_CHECK(attr_error == cudaSuccess,

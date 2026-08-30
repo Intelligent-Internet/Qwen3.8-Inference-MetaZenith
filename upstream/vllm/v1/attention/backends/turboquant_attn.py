@@ -418,6 +418,111 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
             layer._tq_cached = True
 
+    def warmup_continuation_prefill(
+        self,
+        layer: torch.nn.Module,
+        max_num_batched_tokens: int,
+        warmed_keys: set[tuple[Any, ...]] | None = None,
+    ) -> tuple[Any, ...] | None:
+        """Warm the lazy dequant and inverse-rotation continuation path."""
+        raw_cache = getattr(layer, "kv_cache", None)
+        if (
+            not isinstance(raw_cache, torch.Tensor)
+            or raw_cache.numel() == 0
+            or raw_cache.device.type != "cuda"
+            or raw_cache.ndim != 4
+            or max_num_batched_tokens <= _CONTINUATION_DECODE_THRESHOLD
+        ):
+            return None
+
+        # Attention binds TQ cache as [blocks, heads, block, slot].  Match the
+        # runtime view used by forward before deriving strides and constants.
+        kv_cache = raw_cache.transpose(1, 2)
+        device = kv_cache.device
+        D = self.head_size
+        Hk = self.num_kv_heads
+        block_size = int(kv_cache.shape[1])
+        if int(kv_cache.shape[2]) != Hk or block_size <= 0:
+            return None
+
+        cfg = self.tq_config
+        compile_key = (
+            device.index,
+            raw_cache.dtype,
+            block_size,
+            Hk,
+            D,
+            cfg.key_mse_bits,
+            cfg.key_packed_size,
+            cfg.effective_value_quant_bits,
+            cfg.key_fp8,
+            cfg.norm_correction,
+        )
+        if warmed_keys is not None:
+            if compile_key in warmed_keys:
+                return None
+            warmed_keys.add(compile_key)
+
+        self._ensure_on_device(layer, device)
+        k_cached = torch.empty((1, Hk, 1, D), device=device, dtype=torch.float16)
+        v_cached = torch.empty_like(k_cached)
+        # Triton specializes scalar integer arguments equal to one.  Give the
+        # table a real multi-block row stride so this compiles the same variant
+        # as serving rather than a stride-1-only warmup variant.
+        num_table_blocks = max(2, math.ceil(max_num_batched_tokens / block_size))
+        block_table = torch.zeros(
+            (1, num_table_blocks), device=device, dtype=torch.int32
+        )
+        _tq_full_dequant_kv[(1, Hk)](
+            kv_cache,
+            block_table,
+            layer._tq_centroids,
+            k_cached,
+            v_cached,
+            k_cached.stride(0),
+            k_cached.stride(1),
+            k_cached.stride(2),
+            v_cached.stride(0),
+            v_cached.stride(1),
+            v_cached.stride(2),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            block_table.stride(0),
+            HEAD_DIM=D,
+            BLOCK_SIZE=block_size,
+            NUM_KV_HEADS=Hk,
+            MSE_BYTES=self._mse_bytes,
+            KPS=cfg.key_packed_size,
+            VQB=cfg.effective_value_quant_bits,
+            VAL_DATA_BYTES=self._val_data_bytes,
+            MSE_BITS=cfg.key_mse_bits,
+            KEY_FP8=1 if cfg.key_fp8 else 0,
+            BLOCK_D=triton.next_power_of_2(D),
+            NORM_CORRECTION=1 if cfg.norm_correction else 0,
+            FP8_E4B15=_use_fp8_e4b15(device.index or 0),
+            num_warps=4,
+        )
+
+        # The first real continuation rotates Hk * cached_len rows.  A
+        # max-chunk representative initializes that large-M GEMM path without
+        # touching model or cache state.
+        rotation_input = torch.zeros(
+            (Hk * max_num_batched_tokens, D),
+            device=device,
+            dtype=torch.float16,
+        )
+        rotation_output = rotation_input @ layer._tq_Pi_half
+        torch.accelerator.synchronize(device)
+        del (
+            block_table,
+            k_cached,
+            v_cached,
+            rotation_input,
+            rotation_output,
+        )
+        return compile_key
+
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,

@@ -129,6 +129,26 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         kimi_k3_triton_warmup(worker)
         fa4_cutedsl_warmup(worker)
         sparse_mla_triton_warmup(worker)
+        if worker.scheduler_config.enable_chunked_prefill:
+            from vllm.v1.attention.backends.turboquant_attn import (
+                TurboQuantAttentionImpl,
+            )
+
+            warmed_tq_keys: set[tuple] = set()
+            for layer in worker.get_model().modules():
+                impl = getattr(layer, "impl", None)
+                if not isinstance(impl, TurboQuantAttentionImpl):
+                    continue
+                impl.warmup_continuation_prefill(
+                    layer,
+                    worker.scheduler_config.max_num_batched_tokens,
+                    warmed_tq_keys,
+                )
+            if warmed_tq_keys:
+                logger.info(
+                    "Warmed %d TurboQuant continuation-prefill kernel layout(s).",
+                    len(warmed_tq_keys),
+                )
 
     if current_platform.has_device_capability(90):
         _warmup_ll_bf16_router_gemm(worker.get_model())

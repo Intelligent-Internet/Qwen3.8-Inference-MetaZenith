@@ -9,6 +9,7 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._ops import OpOverload
 
 from vllm.config import VllmConfig
+from vllm.config.utils import Range
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -320,3 +321,7 @@ class ActivationQuantFusionPass(VllmFusionPatternMatcherPass):
                 )
 
         self.dump_patterns(config, self.pm_pass)
+
+    def is_applicable_for_range(self, compile_range: Range) -> bool:
+        min_token_num = self.pass_config.act_quant_fusion_min_token_num
+        return min_token_num is None or compile_range.start >= min_token_num

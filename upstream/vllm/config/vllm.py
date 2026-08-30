@@ -2013,6 +2013,22 @@ class VllmConfig:
                 # This creates ranges: [1, min-1] (no SP), [min, max] (SP applies)
                 computed_compile_ranges_endpoints.append(min_token_num - 1)
 
+        if compilation_config.pass_config.fuse_act_quant:
+            min_token_num = (
+                compilation_config.pass_config.act_quant_fusion_min_token_num
+            )
+            if min_token_num is not None:
+                assert min_token_num > 1, (
+                    "act_quant_fusion_min_token_num must be greater than 1"
+                )
+                if (
+                    compile_range_end is not None
+                    and min_token_num <= compile_range_end
+                ):
+                    # Keep small-token decode graphs unfused while allowing the
+                    # activation-quant fusion in the following compile range.
+                    computed_compile_ranges_endpoints.append(min_token_num - 1)
+
         if compilation_config.pass_config.fuse_rope_kvcache:
             max_token_num = (
                 compilation_config.pass_config.rope_kvcache_fusion_max_token_num

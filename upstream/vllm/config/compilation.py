@@ -122,6 +122,10 @@ class PassConfig:
     """Fuse the custom RMSNorm + quant ops."""
     fuse_act_quant: bool = None  # type: ignore[assignment]
     """Fuse the custom SiluMul + quant ops."""
+    act_quant_fusion_min_token_num: int | None = None
+    """Only apply activation-quantization fusion to compilation ranges that
+    start at or above this token count. Unspecified applies the fusion to all
+    compilation ranges."""
     fuse_attn_quant: bool = None  # type: ignore[assignment]
     """Fuse the custom Attention and MLAAttention + quant ops."""
     eliminate_noops: bool = Field(default=True)

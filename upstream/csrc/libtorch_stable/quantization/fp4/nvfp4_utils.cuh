@@ -303,7 +303,10 @@ __device__ __forceinline__ fp4_packed_t cvt_warp_fp16_to_fp4(
 
 // silu in float32
 __device__ __forceinline__ float silu(float x) {
-  return __fdividef(x, (1.f + __expf(-x)));
+  // Match the materialized BF16 SiLU path exactly before FP4 quantization.
+  // The CUDA activation kernel uses expf and ordinary division; the fast
+  // intrinsics can cross FP4 bin and scale boundaries.
+  return x / (1.f + expf(-x));
 }
 
 __device__ __forceinline__ float2 silu2(float2 x) {
@@ -318,9 +321,13 @@ __inline__ __device__ PackedVec<Type, CVT_FP4_PACK16> compute_silu_mul(
 
 #pragma unroll
   for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; ++i) {
-    // silu_mul in float32
+    // Match aten.silu(BF16) * BF16: round the SiLU result to the input
+    // type before multiplying, then round the product below. Keeping both
+    // conversions in registers avoids materializing the BF16 activation.
     using packed_t = typename PackedTypeConverter<Type>::Type;
-    float2 silu_vec = silu2(cast_to_float2(x_vec.elts[i]));
+    packed_t silu_packed =
+        cast_to_packed<packed_t>(silu2(cast_to_float2(x_vec.elts[i])));
+    float2 silu_vec = cast_to_float2(silu_packed);
     float2 y_f2 = cast_to_float2(y_vec.elts[i]);
     result.elts[i] = cast_to_packed<packed_t>(
         make_float2(silu_vec.x * y_f2.x, silu_vec.y * y_f2.y));

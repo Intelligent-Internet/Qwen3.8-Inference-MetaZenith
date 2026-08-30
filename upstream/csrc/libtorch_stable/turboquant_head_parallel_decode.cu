@@ -243,7 +243,8 @@ __global__ void turboquant_head_parallel_stage1_kernel(
 // warps prepare the following token tile while the first three warps execute
 // the unchanged per-head attention math on the current tile.  The two
 // CTA-wide barriers form the buffer-ready/buffer-released handoff.
-template <int kTileTokens, bool kBoundaryOnly = false>
+template <int kTileTokens, int kActiveSplits = kNumSplits,
+          bool kBoundaryOnly = false>
 __global__ void turboquant_head_parallel_stage1_pipeline_kernel(
     const float* __restrict__ query, const uint8_t* __restrict__ cache,
     const int32_t* __restrict__ block_table,
@@ -271,7 +272,7 @@ __global__ void turboquant_head_parallel_stage1_pipeline_kernel(
   }
 
   const int seq_len = seq_lens[batch];
-  const int split_len = (seq_len + kNumSplits - 1) / kNumSplits;
+  const int split_len = (seq_len + kActiveSplits - 1) / kActiveSplits;
   const int split_start = split_len * split;
   const int split_end = min(split_start + split_len, seq_len);
   const int split_tokens = max(split_end - split_start, 0);
@@ -427,7 +428,7 @@ __global__ void turboquant_head_parallel_stage1_pipeline_kernel(
       float* out_head =
           output + ((batch * kNumQueryHeads +
                      kv_head * (kHeadWarps * kHeadsPerWarp) + local_head) *
-                        kNumSplits +
+                        kActiveSplits +
                     split) *
                        (kHeadDim + 1);
 #pragma unroll
@@ -459,7 +460,8 @@ void launch_turboquant_head_parallel(
           table_stride);
 }
 
-template <int kTileTokens, bool kBoundaryOnly = false>
+template <int kTileTokens, int kActiveSplits = kNumSplits,
+          bool kBoundaryOnly = false>
 void launch_turboquant_head_parallel_pipeline(
     const float* query, const uint8_t* cache, const int32_t* block_table,
     const int32_t* seq_lens, const float* centroids, float* output,
@@ -468,9 +470,10 @@ void launch_turboquant_head_parallel_pipeline(
     int64_t table_stride, cudaStream_t stream,
     const int32_t* table_mismatch = nullptr) {
   const dim3 grid(static_cast<unsigned int>(batch_size), kNumKvHeads,
-                  kNumSplits);
+                  kActiveSplits);
   constexpr int kWarps = kHeadWarps + kTileTokens;
-  turboquant_head_parallel_stage1_pipeline_kernel<kTileTokens, kBoundaryOnly>
+  turboquant_head_parallel_stage1_pipeline_kernel<
+      kTileTokens, kActiveSplits, kBoundaryOnly>
       <<<grid, kWarps * 32, 0, stream>>>(
           query, cache, block_table, seq_lens, centroids, output,
           cache_block_stride, cache_position_stride, cache_head_stride,
@@ -520,9 +523,11 @@ void turboquant_head_parallel_stage1_impl(
                       seq_lens.size(0) == batch_size &&
                       centroids.dim() == 1 && centroids.size(0) == 16,
                   "turboquant_head_parallel_stage1: metadata shape mismatch");
+  const int64_t active_splits = output.dim() == 4 ? output.size(2) : -1;
   STD_TORCH_CHECK(output.dim() == 4 && output.size(0) == batch_size &&
                       output.size(1) == kNumQueryHeads &&
-                      output.size(2) == kNumSplits &&
+                      (active_splits == kNumSplits ||
+                       (batch_size == 4 && active_splits == 28)) &&
                       output.size(3) == kHeadDim + 1,
                   "turboquant_head_parallel_stage1: output shape mismatch");
   STD_TORCH_CHECK(query.is_contiguous() && seq_lens.is_contiguous() &&
@@ -553,16 +558,31 @@ void turboquant_head_parallel_stage1_impl(
                         table_mismatch->numel() == 1 &&
                         table_mismatch->is_contiguous(),
                     "boundary-only TurboQuant requires one int32 CUDA proof");
-    launch_turboquant_head_parallel_pipeline<8, true>(
-        query_ptr, cache_ptr, table_ptr, seq_ptr, centroids_ptr, output_ptr,
-        batch_size, cache_block_stride, cache_position_stride,
-        cache_head_stride, table_stride, stream,
-        table_mismatch->const_data_ptr<int32_t>());
+    if (active_splits == 28) {
+      launch_turboquant_head_parallel_pipeline<8, 28, true>(
+          query_ptr, cache_ptr, table_ptr, seq_ptr, centroids_ptr, output_ptr,
+          batch_size, cache_block_stride, cache_position_stride,
+          cache_head_stride, table_stride, stream,
+          table_mismatch->const_data_ptr<int32_t>());
+    } else {
+      launch_turboquant_head_parallel_pipeline<8, kNumSplits, true>(
+          query_ptr, cache_ptr, table_ptr, seq_ptr, centroids_ptr, output_ptr,
+          batch_size, cache_block_stride, cache_position_stride,
+          cache_head_stride, table_stride, stream,
+          table_mismatch->const_data_ptr<int32_t>());
+    }
   } else {
-    launch_turboquant_head_parallel_pipeline<8, false>(
-        query_ptr, cache_ptr, table_ptr, seq_ptr, centroids_ptr, output_ptr,
-        batch_size, cache_block_stride, cache_position_stride,
-        cache_head_stride, table_stride, stream);
+    if (active_splits == 28) {
+      launch_turboquant_head_parallel_pipeline<8, 28, false>(
+          query_ptr, cache_ptr, table_ptr, seq_ptr, centroids_ptr, output_ptr,
+          batch_size, cache_block_stride, cache_position_stride,
+          cache_head_stride, table_stride, stream);
+    } else {
+      launch_turboquant_head_parallel_pipeline<8, kNumSplits, false>(
+          query_ptr, cache_ptr, table_ptr, seq_ptr, centroids_ptr, output_ptr,
+          batch_size, cache_block_stride, cache_position_stride,
+          cache_head_stride, table_stride, stream);
+    }
   }
   const cudaError_t error = cudaGetLastError();
   STD_TORCH_CHECK(error == cudaSuccess,

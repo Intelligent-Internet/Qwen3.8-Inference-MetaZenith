@@ -736,7 +736,8 @@ def triton_turboquant_decode_attention(
     lse_buf: torch.Tensor | None = None,
     table_mismatch_buf: torch.Tensor | None = None,
     buf_holder: Any = None,
-    max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
+    max_num_kv_splits: int = 32,
+    num_kv_splits: int | None = None,
     block_kv: int = 2,
     use_head_parallel_stage1: bool = False,
     tq_spec_decode_shared: bool = False,
@@ -765,7 +766,10 @@ def triton_turboquant_decode_attention(
             PiT = Pi.T.contiguous()
         q_rot = (q_float @ PiT).contiguous()
 
-    NUM_KV_SPLITS = max_num_kv_splits
+    NUM_KV_SPLITS = (
+        max_num_kv_splits if num_kv_splits is None else num_kv_splits
+    )
+    assert 0 < NUM_KV_SPLITS <= max_num_kv_splits
 
     if (
         mid_o_buf is not None
@@ -806,7 +810,10 @@ def triton_turboquant_decode_attention(
     use_native_head_parallel = (
         use_six_scalar
         and use_head_parallel_stage1
-        and NUM_KV_SPLITS == 32
+        and (
+            NUM_KV_SPLITS == 32
+            or (B == 4 and NUM_KV_SPLITS == 28)
+        )
         and block_size == 16
         and kv_cache.shape[3] == 268
         and scale == 0.0625

@@ -433,7 +433,8 @@ void turboquant_shared_rows_tile20_stage1_kernel(
 // Exact same-split B4 producer/consumer kernel. Three two-head CTA groups
 // retain target parallelism while sharing historical KV across four causal rows.
 template <int kTileTokens = 20, int kLoaderWarps = 5,
-          int kHeadsPerWarp = 6, int kHeadGroups = 1>
+          int kHeadsPerWarp = 6, int kHeadGroups = 1,
+          int kActiveSplits = kSplits>
 __global__ __launch_bounds__((4 + kLoaderWarps) * 32,
                              kHeadGroups == 1 ? 1 : 2)
 void turboquant_shared4_grid3_pipeline_kernel(
@@ -449,7 +450,6 @@ void turboquant_shared4_grid3_pipeline_kernel(
   static_assert(kHeadGroups == 1 ||
                 kHeadGroups * kHeadsPerWarp == 6);
   constexpr int kBlockSize = 16;
-  constexpr int kSplits = 32;
   constexpr float kScale = 0.0625f;
   const int group = blockIdx.x / kHeadGroups;
   const int head_group = blockIdx.x - group * kHeadGroups;
@@ -471,9 +471,9 @@ void turboquant_shared4_grid3_pipeline_kernel(
   }
 
   const int seq_len = seq[batch];
-  const int split_len = (seq_len + kSplits - 1) / kSplits;
+  const int split_len = (seq_len + kActiveSplits - 1) / kActiveSplits;
   const int common_split_len =
-      (seq[group * kRows] + kSplits - 1) / kSplits;
+      (seq[group * kRows] + kActiveSplits - 1) / kActiveSplits;
   const int split_start = split_len * split;
   const int split_end = min(split_start + split_len, seq_len);
   const int row_split_tokens = max(split_end - split_start, 0);
@@ -483,7 +483,7 @@ void turboquant_shared4_grid3_pipeline_kernel(
   for (int other_row = 0; other_row < kRows; ++other_row) {
     const int other_seq_len = seq[group * kRows + other_row];
     const int other_split_len =
-        (other_seq_len + kSplits - 1) / kSplits;
+        (other_seq_len + kActiveSplits - 1) / kActiveSplits;
     const int other_start = other_split_len * split;
     const int other_end =
         min(other_start + other_split_len, other_seq_len);
@@ -648,7 +648,7 @@ void turboquant_shared4_grid3_pipeline_kernel(
       const int local_head = head_group * kHeadsPerWarp + h;
       const float safe_l = l[h] > 0.0f ? l[h] : 1.0f;
       float* out_head = out +
-          ((batch * 24 + kv_head * 6 + local_head) * kSplits + split) *
+          ((batch * 24 + kv_head * 6 + local_head) * kActiveSplits + split) *
               257;
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
@@ -667,6 +667,7 @@ void turboquant_shared4_grid3_pipeline_kernel(
 // Hoist the physical-page proof out of the attention CTAs.  One small launch
 // compares all active entries exactly once per layer; both following kernels
 // consume the same stream-ordered mismatch scalar and form exact complements.
+template <int kActiveSplits = kSplits>
 __global__ void turboquant_b4_table_identity_proof_kernel(
     const int* __restrict__ table, const int* __restrict__ seq,
     int* __restrict__ mismatch, int table_stride) {
@@ -676,10 +677,12 @@ __global__ void turboquant_b4_table_identity_proof_kernel(
     max_seq = max(max_seq, seq[row]);
   }
   if (threadIdx.x == 0 && blockIdx.x == 0) {
-    const int common_split_len = (seq[0] + kSplits - 1) / kSplits;
+    const int common_split_len =
+        (seq[0] + kActiveSplits - 1) / kActiveSplits;
 #pragma unroll
     for (int row = 1; row < 4; ++row) {
-      if ((seq[row] + kSplits - 1) / kSplits != common_split_len) {
+      if ((seq[row] + kActiveSplits - 1) / kActiveSplits !=
+          common_split_len) {
         atomicExch(mismatch, 1);
       }
     }
@@ -745,8 +748,12 @@ void turboquant_shared_rows_stage1(const torch::stable::Tensor& query,
                       table_mismatch.is_contiguous() &&
                       table_mismatch.numel() == 1,
                   "turboquant_shared_rows_stage1 received unsupported strides");
+  const int active_splits =
+      output.dim() == 4 ? static_cast<int>(output.size(2)) : -1;
   STD_TORCH_CHECK(output.dim() == 4 && output.size(0) == query.size(0) &&
-                      output.size(1) == kHeads && output.size(2) == kSplits &&
+                      output.size(1) == kHeads &&
+                      (active_splits == kSplits ||
+                       (query.size(0) == 4 && active_splits == 28)) &&
                       output.size(3) == kHeadDim + 1,
                   "turboquant_shared_rows_stage1 received unsupported output shape");
 
@@ -761,31 +768,55 @@ void turboquant_shared_rows_stage1(const torch::stable::Tensor& query,
     constexpr int kHeadGroups = 3;
     constexpr int kSharedBytes =
         sizeof(float) * (4 * kTileTokens * kHeadDim + 2 * kTileTokens);
-    const cudaError_t attr_error = cudaFuncSetAttribute(
-        turboquant_shared4_grid3_pipeline_kernel<
-            kTileTokens, kLoaderWarps, kHeadsPerWarp, kHeadGroups>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);
-    STD_TORCH_CHECK(attr_error == cudaSuccess,
-                    "turboquant B4 grid3 shared-memory opt-in failed: ",
-                    cudaGetErrorString(attr_error));
-    const dim3 grid(batch_size / 4 * kHeadGroups, kKvHeads, kSplits);
     cudaMemsetAsync(table_mismatch.mutable_data_ptr<int>(), 0, sizeof(int),
                     stream);
-    turboquant_b4_table_identity_proof_kernel<<<4, 256, 0, stream>>>(
-        block_table.const_data_ptr<int>(), seq_lens.const_data_ptr<int>(),
-        table_mismatch.mutable_data_ptr<int>(),
-        static_cast<int>(block_table.stride(0)));
-    turboquant_shared4_grid3_pipeline_kernel<
-        kTileTokens, kLoaderWarps, kHeadsPerWarp, kHeadGroups>
-        <<<grid, (4 + kLoaderWarps) * 32, kSharedBytes, stream>>>(
-            query.const_data_ptr<float>(), cache.const_data_ptr<uint8_t>(),
-            block_table.const_data_ptr<int>(), seq_lens.const_data_ptr<int>(),
-            centroids.const_data_ptr<float>(), output.mutable_data_ptr<float>(),
-            static_cast<long long>(cache.stride(0)),
-            static_cast<long long>(cache.stride(1)),
-            static_cast<long long>(cache.stride(2)),
-            static_cast<int>(block_table.stride(0)),
-            table_mismatch.const_data_ptr<int>());
+    if (active_splits == 28) {
+      const auto kernel = turboquant_shared4_grid3_pipeline_kernel<
+          kTileTokens, kLoaderWarps, kHeadsPerWarp, kHeadGroups, 28>;
+      const cudaError_t attr_error = cudaFuncSetAttribute(
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);
+      STD_TORCH_CHECK(attr_error == cudaSuccess,
+                      "turboquant B4 split-28 shared-memory opt-in failed: ",
+                      cudaGetErrorString(attr_error));
+      const dim3 grid(batch_size / 4 * kHeadGroups, kKvHeads, 28);
+      turboquant_b4_table_identity_proof_kernel<28><<<4, 256, 0, stream>>>(
+          block_table.const_data_ptr<int>(), seq_lens.const_data_ptr<int>(),
+          table_mismatch.mutable_data_ptr<int>(),
+          static_cast<int>(block_table.stride(0)));
+      kernel<<<grid, (4 + kLoaderWarps) * 32, kSharedBytes, stream>>>(
+          query.const_data_ptr<float>(), cache.const_data_ptr<uint8_t>(),
+          block_table.const_data_ptr<int>(), seq_lens.const_data_ptr<int>(),
+          centroids.const_data_ptr<float>(), output.mutable_data_ptr<float>(),
+          static_cast<long long>(cache.stride(0)),
+          static_cast<long long>(cache.stride(1)),
+          static_cast<long long>(cache.stride(2)),
+          static_cast<int>(block_table.stride(0)),
+          table_mismatch.const_data_ptr<int>());
+    } else {
+      const auto kernel = turboquant_shared4_grid3_pipeline_kernel<
+          kTileTokens, kLoaderWarps, kHeadsPerWarp, kHeadGroups, kSplits>;
+      const cudaError_t attr_error = cudaFuncSetAttribute(
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSharedBytes);
+      STD_TORCH_CHECK(attr_error == cudaSuccess,
+                      "turboquant B4 grid3 shared-memory opt-in failed: ",
+                      cudaGetErrorString(attr_error));
+      const dim3 grid(batch_size / 4 * kHeadGroups, kKvHeads, kSplits);
+      turboquant_b4_table_identity_proof_kernel<kSplits>
+          <<<4, 256, 0, stream>>>(
+              block_table.const_data_ptr<int>(),
+              seq_lens.const_data_ptr<int>(),
+              table_mismatch.mutable_data_ptr<int>(),
+              static_cast<int>(block_table.stride(0)));
+      kernel<<<grid, (4 + kLoaderWarps) * 32, kSharedBytes, stream>>>(
+          query.const_data_ptr<float>(), cache.const_data_ptr<uint8_t>(),
+          block_table.const_data_ptr<int>(), seq_lens.const_data_ptr<int>(),
+          centroids.const_data_ptr<float>(), output.mutable_data_ptr<float>(),
+          static_cast<long long>(cache.stride(0)),
+          static_cast<long long>(cache.stride(1)),
+          static_cast<long long>(cache.stride(2)),
+          static_cast<int>(block_table.stride(0)),
+          table_mismatch.const_data_ptr<int>());
+    }
   } else if (batch_size == 8) {
     const dim3 grid(batch_size / 2, kKvHeads, kSplits);
     turboquant_shared_rows_stage1_kernel<2><<<grid, 64, 0, stream>>>(

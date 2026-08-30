@@ -81,6 +81,7 @@ TURBOQUANT_FULL_CUDAGRAPH_MAX_SEQ_LENS = (
     TURBOQUANT_HEAD_PARALLEL_CONTEXT_THRESHOLD,
 )
 TURBOQUANT_SPEC_DECODE_NUM_SPLITS = 32
+TURBOQUANT_LONG_B4_NUM_SPLITS = 28
 TURBOQUANT_SPEC_NUM_KV_HEADS = 4
 TURBOQUANT_SPEC_SLOT_SIZE_BYTES = 268
 TURBOQUANT_SPEC_PAIR_MIN_KV_BYTES = 90 * 1024 * 1024
@@ -1032,13 +1033,31 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         B = query.shape[0]
         D = self.head_size
         S = self.max_num_kv_splits
+        active_splits = (
+            TURBOQUANT_LONG_B4_NUM_SPLITS
+            if S >= TURBOQUANT_LONG_B4_NUM_SPLITS
+            and B == 4
+            and attn_metadata.max_seq_len
+            >= TURBOQUANT_HEAD_PARALLEL_CONTEXT_THRESHOLD
+            and self.num_heads == 24
+            and self.num_kv_heads == 4
+            and self.head_size == 256
+            and self.tq_config.key_mse_bits == 4
+            and self.tq_config.key_packed_size == 130
+            and self.tq_config.effective_value_quant_bits == 4
+            and not self.tq_config.key_fp8
+            and self.tq_config.norm_correction
+            and kv_cache.shape[3] == TURBOQUANT_SPEC_SLOT_SIZE_BYTES
+            and self.scale == 0.0625
+            else S
+        )
         Hq = self.num_heads
         mid_o_buf = output_buf = lse_buf = table_mismatch_buf = None
         if is_workspace_manager_initialized():
             # output_buf in query dtype — matches the in-kernel fp16 cast in stage2.
             mid_o_buf, output_buf, lse_buf, table_mismatch_buf = (
                 current_workspace_manager().get_simultaneous(
-                    ((B, Hq, S, D + 1), torch.float32),
+                    ((B, Hq, active_splits, D + 1), torch.float32),
                     ((B, Hq, D), query.dtype),
                     ((B, Hq), torch.float32),
                     ((1,), torch.int32),
@@ -1067,6 +1086,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             table_mismatch_buf=table_mismatch_buf,
             buf_holder=layer,
             max_num_kv_splits=self.max_num_kv_splits,
+            num_kv_splits=active_splits,
             block_kv=4
             if attn_metadata.max_seq_len
             < TURBOQUANT_DECODE_TILE_CONTEXT_THRESHOLD

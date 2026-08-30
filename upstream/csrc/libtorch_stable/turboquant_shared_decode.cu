@@ -379,8 +379,6 @@ void turboquant_shared_rows_tile20_stage1_kernel(
       }
       const bool valid1 =
           tile * kTileTokens + token1 < row_split_tokens;
-      float score0[6];
-      float score1[6];
 #pragma unroll
       for (int head = 0; head < kHeadsPerKv; ++head) {
         float products0[8];
@@ -395,17 +393,12 @@ void turboquant_shared_rows_tile20_stage1_kernel(
         float s1 = warp_sum(lane_reduce8(products1));
         s0 = s0 * shared_key_norm[token0] * kAttentionScale;
         s1 = s1 * shared_key_norm[token1] * kAttentionScale;
-        score0[head] = s0;
-        score1[head] = valid1 ? s1 : negative_infinity;
-      }
-
-#pragma unroll
-      for (int head = 0; head < kHeadsPerKv; ++head) {
+        s1 = valid1 ? s1 : negative_infinity;
         const float next_m =
-            fmaxf(fmaxf(score0[head], score1[head]), m[head]);
+            fmaxf(fmaxf(s0, s1), m[head]);
         const float rescale = tq_exp(m[head] - next_m);
-        const float p0 = tq_exp(score0[head] - next_m);
-        const float p1 = tq_exp(score1[head] - next_m);
+        const float p0 = tq_exp(s0 - next_m);
+        const float p1 = tq_exp(s1 - next_m);
 #pragma unroll
         for (int k = 0; k < 8; ++k) {
           const int d = lane + k * 32;

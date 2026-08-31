@@ -159,7 +159,9 @@ class TurboQuantConfig:
     def slot_size(self) -> int:
         """Total packed bytes per head per position (key + value combined).
 
-        Layout: [key_packed | value_packed]
+        Generic layout: [key_packed | value_packed]. The aligned 268-byte
+        D256/MSE4/V4/NC specialization keeps the same logical sizes but stores
+        [key indices | value data | key norm | value scale/zero | metadata].
         """
         return self.key_packed_size + self.value_packed_size
 
@@ -173,8 +175,9 @@ class TurboQuantConfig:
         s = self.slot_size
         # The exact native 256D MSE4/value4 norm-correction decoder reuses an
         # immutable FP32 inverse norm derived from the packed centroid key.
-        # Keep the original 262-byte payload intact, align the metadata, and
-        # append four bytes. Other TurboQuant layouts retain their ABI.
+        # Its 262-byte payload is [128 key indices | 128 value data | 2 key
+        # norm | 4 value scale/zero]. Align the metadata and append four bytes.
+        # Other TurboQuant layouts retain the generic ABI.
         if (
             self.head_dim == 256
             and not self.key_fp8

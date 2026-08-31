@@ -18,6 +18,15 @@ constexpr int kHeadsPerKv = 6;
 constexpr int kHeadDim = 256;
 constexpr int kBlockSize = 16;
 constexpr int kSlotSize = 268;
+constexpr int kPackedValueOffset = 128;
+constexpr int kKeyNormOffset = 256;
+constexpr int kValueScaleOffset = 258;
+constexpr int kValueZeroOffset = 260;
+constexpr int kCachedInvNormOffset = 264;
+static_assert(kPackedValueOffset % alignof(std::uint32_t) == 0);
+static_assert(kPackedValueOffset + kHeadDim / 2 == kKeyNormOffset);
+static_assert(kKeyNormOffset + sizeof(std::uint16_t) == kValueScaleOffset);
+static_assert(kCachedInvNormOffset + sizeof(float) == kSlotSize);
 constexpr int kSplits = 32;
 constexpr float kAttentionScale = 0.0625f;
 
@@ -161,22 +170,27 @@ __global__ __launch_bounds__(128, 2) void turboquant_shared_rows_stage1_kernel(
 
       float key_part[8];
       float value_part[8];
-      const float value_scale = valid ? unpack_half(slot + 258) : 0.0f;
-      const float value_zero = valid ? unpack_half(slot + 260) : 0.0f;
+      const float value_scale =
+          valid ? unpack_half(slot + kValueScaleOffset) : 0.0f;
+      const float value_zero =
+          valid ? unpack_half(slot + kValueZeroOffset) : 0.0f;
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
         const int d = lane + k * 32;
         const uint8_t key_byte = valid ? slot[d >> 1] : 0;
         const int key_idx = (key_byte >> ((d & 1) * 4)) & 15;
         key_part[k] = valid ? centroids[key_idx] : 0.0f;
-        const uint8_t value_byte = valid ? slot[130 + (d >> 1)] : 0;
+        const uint8_t value_byte =
+            valid ? slot[kPackedValueOffset + (d >> 1)] : 0;
         const float value_idx = static_cast<float>(
             (value_byte >> ((d & 1) * 4)) & 15);
         value_part[k] = value_idx * value_scale + value_zero;
       }
 
       const float inv_norm =
-          valid ? *reinterpret_cast<const float*>(slot + 264) : 0.0f;
+          valid
+          ? *reinterpret_cast<const float*>(slot + kCachedInvNormOffset)
+          : 0.0f;
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
         const int d = lane + k * 32;
@@ -185,7 +199,7 @@ __global__ __launch_bounds__(128, 2) void turboquant_shared_rows_stage1_kernel(
       }
       if (lane == 0) {
         shared_key_norm[storage_row][token_in_tile] =
-            valid ? unpack_half(slot + 128) : 0.0f;
+            valid ? unpack_half(slot + kKeyNormOffset) : 0.0f;
       }
     }
     __syncthreads();
@@ -339,8 +353,10 @@ void turboquant_shared_rows_tile20_stage1_kernel(
           static_cast<long long>(page_offset) * cache_position_stride +
           static_cast<long long>(kv_head) * cache_head_stride;
 
-      const float value_scale = valid ? unpack_half(slot + 258) : 0.0f;
-      const float value_zero = valid ? unpack_half(slot + 260) : 0.0f;
+      const float value_scale =
+          valid ? unpack_half(slot + kValueScaleOffset) : 0.0f;
+      const float value_zero =
+          valid ? unpack_half(slot + kValueZeroOffset) : 0.0f;
       float key_part[8];
       float value_part[8];
 #pragma unroll
@@ -349,14 +365,17 @@ void turboquant_shared_rows_tile20_stage1_kernel(
         const uint8_t key_byte = valid ? slot[d >> 1] : 0;
         const int key_idx = (key_byte >> ((d & 1) * 4)) & 15;
         key_part[k] = valid ? centroids[key_idx] : 0.0f;
-        const uint8_t value_byte = valid ? slot[130 + (d >> 1)] : 0;
+        const uint8_t value_byte =
+            valid ? slot[kPackedValueOffset + (d >> 1)] : 0;
         const float value_idx = static_cast<float>(
             (value_byte >> ((d & 1) * 4)) & 15);
         value_part[k] = value_idx * value_scale + value_zero;
       }
 
       const float inv_norm =
-          valid ? *reinterpret_cast<const float*>(slot + 264) : 0.0f;
+          valid
+          ? *reinterpret_cast<const float*>(slot + kCachedInvNormOffset)
+          : 0.0f;
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
         const int d = lane + k * 32;
@@ -365,7 +384,7 @@ void turboquant_shared_rows_tile20_stage1_kernel(
       }
       if (lane == 0) {
         shared_key_norm[token_in_tile] =
-            valid ? unpack_half(slot + 128) : 0.0f;
+            valid ? unpack_half(slot + kKeyNormOffset) : 0.0f;
       }
     }
     __syncthreads();
@@ -554,27 +573,21 @@ void turboquant_shared4_grid3_pipeline_kernel(
           cache + static_cast<long long>(block) * cache_block_stride +
           static_cast<long long>(page_offset) * cache_position_stride +
           static_cast<long long>(kv_head) * cache_head_stride;
-      const float value_scale = valid ? unpack_half(slot + 258) : 0.0f;
-      const float value_zero = valid ? unpack_half(slot + 260) : 0.0f;
+      const float value_scale =
+          valid ? unpack_half(slot + kValueScaleOffset) : 0.0f;
+      const float value_zero =
+          valid ? unpack_half(slot + kValueZeroOffset) : 0.0f;
       float key_part[8];
       float value_part[8];
       std::uint32_t packed_key_word = 0;
       std::uint32_t packed_value_word = 0;
       if constexpr (kVectorPackedLoads) {
         if (valid) {
-          // A normal slot base is four-byte aligned.  The value payload starts
-          // at byte 130, so combine two naturally aligned 16-bit loads rather
-          // than issuing an unaligned 32-bit access.
+          // Both 128-byte packed payloads are naturally four-byte aligned.
           packed_key_word = *reinterpret_cast<const std::uint32_t*>(
               slot + lane * 4);
-          const std::uint16_t value_lo =
-              *reinterpret_cast<const std::uint16_t*>(
-                  slot + 130 + lane * 4);
-          const std::uint16_t value_hi =
-              *reinterpret_cast<const std::uint16_t*>(
-                  slot + 132 + lane * 4);
-          packed_value_word = static_cast<std::uint32_t>(value_lo) |
-              (static_cast<std::uint32_t>(value_hi) << 16);
+          packed_value_word = *reinterpret_cast<const std::uint32_t*>(
+              slot + kPackedValueOffset + lane * 4);
         }
       }
 #pragma unroll
@@ -587,15 +600,16 @@ void turboquant_shared4_grid3_pipeline_kernel(
         key_part[k] = valid ? centroids[key_idx] : 0.0f;
         const uint8_t value_byte = kVectorPackedLoads
             ? static_cast<uint8_t>(packed_value_word >> ((k >> 1) * 8))
-            : (valid ? slot[130 + (d >> 1)] : 0);
+            : (valid ? slot[kPackedValueOffset + (d >> 1)] : 0);
         const float value_idx = static_cast<float>(
             (value_byte >> ((d & 1) * 4)) & 15);
         value_part[k] = value_idx * value_scale + value_zero;
       }
       const float inv_norm = valid
           ? (kUnalignedCachedNorm
-                 ? unpack_float_unaligned(slot + 264)
-                 : *reinterpret_cast<const float*>(slot + 264))
+                 ? unpack_float_unaligned(slot + kCachedInvNormOffset)
+                 : *reinterpret_cast<const float*>(
+                       slot + kCachedInvNormOffset))
           : 0.0f;
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
@@ -605,7 +619,7 @@ void turboquant_shared4_grid3_pipeline_kernel(
       }
       if (lane == 0) {
         shared_key_norm[buffer][loader_token] =
-            valid ? unpack_half(slot + 128) : 0.0f;
+            valid ? unpack_half(slot + kKeyNormOffset) : 0.0f;
       }
     }
   };

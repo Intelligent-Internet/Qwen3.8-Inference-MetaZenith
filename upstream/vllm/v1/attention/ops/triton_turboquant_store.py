@@ -37,9 +37,13 @@ def _store_quantized_value(
     BLOCK_D: tl.constexpr,
     BLOCK_VAL: tl.constexpr,
     BLOCK_GRP: tl.constexpr,
+    ALIGNED_SPEC_LAYOUT: tl.constexpr = 0,
 ):
     """Uniform quantization of values to VQB bits, pack, and store with scale/zero."""
-    val_cache_offset = KPS
+    # The 268-byte D256/MSE4/V4/NC specialization places the packed value
+    # immediately after the 128-byte key indices.  The key norm moves behind
+    # the value, while scale/zero retain their generic offsets.
+    val_cache_offset = KPS - 2 if ALIGNED_SPEC_LAYOUT else KPS
 
     if VQB == 3:
         val_vec = tl.load(Value_ptr + base + d_offs, mask=d_mask, other=0.0).to(
@@ -78,7 +82,7 @@ def _store_quantized_value(
             mask=grp_mask,
         )
 
-        sc_offset = val_cache_offset + VAL_DATA_BYTES
+        sc_offset = KPS + VAL_DATA_BYTES
         sc_f16 = v_scale.to(tl.float16)
         sc_u16 = sc_f16.to(tl.uint16, bitcast=True)
         tl.store(KV_cache_ptr + slot_base + sc_offset, (sc_u16 & 0xFF).to(tl.uint8))
@@ -119,7 +123,7 @@ def _store_quantized_value(
             mask=val_mask,
         )
 
-        sc_offset = val_cache_offset + VAL_DATA_BYTES
+        sc_offset = KPS + VAL_DATA_BYTES
         sc_f16 = v_scale.to(tl.float16)
         sc_u16 = sc_f16.to(tl.uint16, bitcast=True)
         tl.store(KV_cache_ptr + slot_base + sc_offset, (sc_u16 & 0xFF).to(tl.uint8))
@@ -205,6 +209,7 @@ def _tq_fused_store_fp8(
         KPS=KPS,
         VQB=VQB,
         VAL_DATA_BYTES=VAL_DATA_BYTES,
+        ALIGNED_SPEC_LAYOUT=False,
         BLOCK_D=BLOCK_D,
         BLOCK_VAL=BLOCK_VAL,
         BLOCK_GRP=BLOCK_GRP,
@@ -252,6 +257,7 @@ def _tq_fused_store_mse(
     MSE_BITS: tl.constexpr,
     N_CENTROIDS: tl.constexpr,
     CACHE_INV_NORM: tl.constexpr,
+    ALIGNED_SPEC_LAYOUT: tl.constexpr = 0,
     BLOCK_GRP: tl.constexpr = 16,
 ):
     """Fused MSE quantize + pack + store.
@@ -320,7 +326,7 @@ def _tq_fused_store_mse(
         tl.store(KV_cache_ptr + slot_base + grp_offs * 3 + 2, b2, mask=grp_mask)
 
     # ── 3. STORE vec_norm (fp16, 2 bytes) ─────────────────────────────
-    norm_offset = MSE_BYTES
+    norm_offset = KPS + VAL_DATA_BYTES - 2 if ALIGNED_SPEC_LAYOUT else MSE_BYTES
 
     vn_f16 = tl.load(Norms_ptr + pid).to(tl.float16)
     vn_u16 = vn_f16.to(tl.uint16, bitcast=True)
@@ -341,6 +347,7 @@ def _tq_fused_store_mse(
         KPS=KPS,
         VQB=VQB,
         VAL_DATA_BYTES=VAL_DATA_BYTES,
+        ALIGNED_SPEC_LAYOUT=ALIGNED_SPEC_LAYOUT,
         BLOCK_D=BLOCK_D,
         BLOCK_VAL=BLOCK_VAL,
         BLOCK_GRP=BLOCK_GRP,
@@ -487,6 +494,7 @@ def triton_turboquant_store(
         MSE_BITS=mse_bits,
         N_CENTROIDS=n_centroids,
         CACHE_INV_NORM=cache_inv_norm,
+        ALIGNED_SPEC_LAYOUT=cache_inv_norm,
         BLOCK_GRP=block_grp,
         num_warps=4,
         num_stages=1,

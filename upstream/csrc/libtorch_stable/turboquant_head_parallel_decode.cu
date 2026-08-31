@@ -10,6 +10,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cstdint>
 
 namespace {
 
@@ -18,6 +19,14 @@ constexpr int kNumKvHeads = 4;
 constexpr int kHeadDim = 256;
 constexpr int kBlockSize = 16;
 constexpr int kSlotSize = 268;
+constexpr int kPackedValueOffset = 128;
+constexpr int kKeyNormOffset = 256;
+constexpr int kValueScaleOffset = 258;
+constexpr int kValueZeroOffset = 260;
+constexpr int kCachedInvNormOffset = 264;
+static_assert(kPackedValueOffset + kHeadDim / 2 == kKeyNormOffset);
+static_assert(kKeyNormOffset + sizeof(std::uint16_t) == kValueScaleOffset);
+static_assert(kCachedInvNormOffset + sizeof(float) == kSlotSize);
 constexpr int kNumSplits = 32;
 constexpr int kHeadWarps = 3;
 constexpr int kHeadsPerWarp = 2;
@@ -136,8 +145,10 @@ __global__ void turboquant_head_parallel_stage1_kernel(
         static_cast<int64_t>(page_offset) * cache_position_stride +
         static_cast<int64_t>(kv_head) * cache_head_stride;
 
-    const float value_scale = valid ? unpack_half(slot + 258) : 0.0f;
-    const float value_zero = valid ? unpack_half(slot + 260) : 0.0f;
+    const float value_scale =
+        valid ? unpack_half(slot + kValueScaleOffset) : 0.0f;
+    const float value_zero =
+        valid ? unpack_half(slot + kValueZeroOffset) : 0.0f;
     float key_part[8];
     float value_part[8];
 #pragma unroll
@@ -146,14 +157,17 @@ __global__ void turboquant_head_parallel_stage1_kernel(
       const uint8_t key_byte = valid ? slot[d >> 1] : 0;
       const int key_idx = (key_byte >> ((d & 1) * 4)) & 15;
       key_part[i] = valid ? centroids[key_idx] : 0.0f;
-      const uint8_t value_byte = valid ? slot[130 + (d >> 1)] : 0;
+      const uint8_t value_byte =
+          valid ? slot[kPackedValueOffset + (d >> 1)] : 0;
       const float value_idx = static_cast<float>(
           (value_byte >> ((d & 1) * 4)) & 15);
       value_part[i] = value_idx * value_scale + value_zero;
     }
 
     const float inv_norm =
-        valid ? *reinterpret_cast<const float*>(slot + 264) : 0.0f;
+        valid
+        ? *reinterpret_cast<const float*>(slot + kCachedInvNormOffset)
+        : 0.0f;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
       const int d = lane + i * 32;
@@ -162,7 +176,7 @@ __global__ void turboquant_head_parallel_stage1_kernel(
     }
     if (lane == 0) {
       shared_key_norm[token_in_tile] =
-          valid ? unpack_half(slot + 128) : 0.0f;
+          valid ? unpack_half(slot + kKeyNormOffset) : 0.0f;
     }
     __syncthreads();
 
@@ -328,8 +342,10 @@ __global__ void turboquant_head_parallel_stage1_pipeline_kernel(
         static_cast<int64_t>(page_offset) * cache_position_stride +
         static_cast<int64_t>(kv_head) * cache_head_stride;
 
-    const float value_scale = valid ? unpack_half(slot + 258) : 0.0f;
-    const float value_zero = valid ? unpack_half(slot + 260) : 0.0f;
+    const float value_scale =
+        valid ? unpack_half(slot + kValueScaleOffset) : 0.0f;
+    const float value_zero =
+        valid ? unpack_half(slot + kValueZeroOffset) : 0.0f;
     float key_part[8];
     float value_part[8];
 #pragma unroll
@@ -338,14 +354,17 @@ __global__ void turboquant_head_parallel_stage1_pipeline_kernel(
       const uint8_t key_byte = valid ? slot[d >> 1] : 0;
       const int key_idx = (key_byte >> ((d & 1) * 4)) & 15;
       key_part[i] = valid ? centroids[key_idx] : 0.0f;
-      const uint8_t value_byte = valid ? slot[130 + (d >> 1)] : 0;
+      const uint8_t value_byte =
+          valid ? slot[kPackedValueOffset + (d >> 1)] : 0;
       const float value_idx = static_cast<float>(
           (value_byte >> ((d & 1) * 4)) & 15);
       value_part[i] = value_idx * value_scale + value_zero;
     }
 
     const float inv_norm =
-        valid ? *reinterpret_cast<const float*>(slot + 264) : 0.0f;
+        valid
+        ? *reinterpret_cast<const float*>(slot + kCachedInvNormOffset)
+        : 0.0f;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
       const int d = lane + i * 32;
@@ -354,7 +373,7 @@ __global__ void turboquant_head_parallel_stage1_pipeline_kernel(
     }
     if (lane == 0) {
       shared_key_norm[buffer][loader_token] =
-          valid ? unpack_half(slot + 128) : 0.0f;
+          valid ? unpack_half(slot + kKeyNormOffset) : 0.0f;
     }
   };
 

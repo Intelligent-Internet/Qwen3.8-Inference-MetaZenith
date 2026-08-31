@@ -83,6 +83,7 @@ def _tq_decode_stage1(
     BLOCK_KV: tl.constexpr,  # tokens per tile (16)
     HEAD_GROUP: tl.constexpr,  # query heads sharing one KV head/load
     KEY_FP8: tl.constexpr,  # 1 if K is stored as FP8
+    ALIGNED_SPEC_LAYOUT: tl.constexpr = 0,  # reordered 268-byte D256/MSE4/V4/NC ABI
     NORM_CORRECTION: tl.constexpr = 0,  # 1 = re-normalize centroids
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
 ):
@@ -231,8 +232,11 @@ def _tq_decode_stage1(
                 axis=2,
             )
 
-            # Load norms (fp16 -> fp32): norms are at MSE_BYTES offset
-            norm_bases = slot_bases + MSE_BYTES
+            # The aligned 268-byte specialization stores the key norm after
+            # the packed value. Generic layouts retain the MSE_BYTES offset.
+            norm_bases = slot_bases + (
+                KPS + VAL_DATA_BYTES - 2 if ALIGNED_SPEC_LAYOUT else MSE_BYTES
+            )
             n_lo = tl.load(KV_cache_ptr + norm_bases, mask=kv_mask, other=0).to(
                 tl.uint16
             )
@@ -254,7 +258,7 @@ def _tq_decode_stage1(
         # ============================================================
         # VALUE LOAD + DEQUANTIZE: [BLOCK_KV, BLOCK_D]
         # ============================================================
-        val_bases = slot_bases + KPS
+        val_bases = slot_bases + (KPS - 2 if ALIGNED_SPEC_LAYOUT else KPS)
 
         if VQB == 3:
             val_addrs0 = val_bases[:, None] + val_byte_idx[None, :]
@@ -271,7 +275,7 @@ def _tq_decode_stage1(
             raw16 = val_raw0 | (val_raw1 << 8)
             v_idx = ((raw16 >> val_bit_shift[None, :]) & 0x7).to(tl.float32)
 
-            sc_bases = val_bases + VAL_DATA_BYTES
+            sc_bases = slot_bases + KPS + VAL_DATA_BYTES
             sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(
                 tl.uint16
             )
@@ -300,7 +304,7 @@ def _tq_decode_stage1(
             ).to(tl.int32)
             v_idx = ((val_raw >> vb_shift[None, :]) & 0xF).to(tl.float32)
 
-            sc_bases = val_bases + VAL_DATA_BYTES
+            sc_bases = slot_bases + KPS + VAL_DATA_BYTES
             sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(
                 tl.uint16
             )
@@ -442,10 +446,10 @@ def _tq_decode_stage1_six_scalar_mse4_v4_nc(
         norm_sq = tl.sum(key * key, axis=1)
         key = key * (1.0 / tl.sqrt(norm_sq + 1e-16))[:, None]
         norm_lo = tl.load(
-            KV_cache_ptr + slot_bases + 128, mask=kv_mask, other=0
+            KV_cache_ptr + slot_bases + 256, mask=kv_mask, other=0
         ).to(tl.uint16)
         norm_hi = tl.load(
-            KV_cache_ptr + slot_bases + 129, mask=kv_mask, other=0
+            KV_cache_ptr + slot_bases + 257, mask=kv_mask, other=0
         ).to(tl.uint16)
         key_norm = (
             (norm_lo | (norm_hi << 8))
@@ -479,7 +483,7 @@ def _tq_decode_stage1_six_scalar_mse4_v4_nc(
         rescale4, p4 = tl.exp(m4 - next_m4), tl.exp(score4 - next_m4)
         rescale5, p5 = tl.exp(m5 - next_m5), tl.exp(score5 - next_m5)
 
-        value_base = slot_bases + 130
+        value_base = slot_bases + 128
         value_raw = tl.load(
             KV_cache_ptr + value_base[:, None] + byte_idx[None, :],
             mask=kv_mask[:, None],
@@ -487,10 +491,10 @@ def _tq_decode_stage1_six_scalar_mse4_v4_nc(
         ).to(tl.int32)
         value_idx = ((value_raw >> bit_shift[None, :]) & 0xF).to(tl.float32)
         scale_lo = tl.load(
-            KV_cache_ptr + value_base + 128, mask=kv_mask, other=0
+            KV_cache_ptr + value_base + 130, mask=kv_mask, other=0
         ).to(tl.uint16)
         scale_hi = tl.load(
-            KV_cache_ptr + value_base + 129, mask=kv_mask, other=0
+            KV_cache_ptr + value_base + 131, mask=kv_mask, other=0
         ).to(tl.uint16)
         value_scale = (
             (scale_lo | (scale_hi << 8))
@@ -498,10 +502,10 @@ def _tq_decode_stage1_six_scalar_mse4_v4_nc(
             .to(tl.float32)
         )
         zero_lo = tl.load(
-            KV_cache_ptr + value_base + 130, mask=kv_mask, other=0
+            KV_cache_ptr + value_base + 132, mask=kv_mask, other=0
         ).to(tl.uint16)
         zero_hi = tl.load(
-            KV_cache_ptr + value_base + 131, mask=kv_mask, other=0
+            KV_cache_ptr + value_base + 133, mask=kv_mask, other=0
         ).to(tl.uint16)
         value_zero = (
             (zero_lo | (zero_hi << 8))
@@ -578,6 +582,7 @@ def _tq_full_dequant_kv(
     MSE_BITS: tl.constexpr,
     KEY_FP8: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    ALIGNED_SPEC_LAYOUT: tl.constexpr = 0,
     NORM_CORRECTION: tl.constexpr = 0,
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
 ):
@@ -632,8 +637,10 @@ def _tq_full_dequant_kv(
             c_inv_norm = 1.0 / tl.sqrt(c_norm_sq + 1e-16)
             k_mse = k_mse * c_inv_norm
 
-        # Norms at MSE_BYTES offset (no QJL bytes)
-        norm_base = slot_base + MSE_BYTES
+        # Norms follow the value data only in the aligned 268-byte target ABI.
+        norm_base = slot_base + (
+            KPS + VAL_DATA_BYTES - 2 if ALIGNED_SPEC_LAYOUT else MSE_BYTES
+        )
         n_lo = tl.load(KV_cache_ptr + norm_base).to(tl.uint16)
         n_hi = tl.load(KV_cache_ptr + norm_base + 1).to(tl.uint16)
         vec_norm = (n_lo | (n_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
@@ -642,7 +649,7 @@ def _tq_full_dequant_kv(
         tl.store(K_out_ptr + ko_base + d_offs, k_recon.to(tl.float16), mask=d_mask)
 
     # === V dequant ===
-    val_base = slot_base + KPS
+    val_base = slot_base + (KPS - 2 if ALIGNED_SPEC_LAYOUT else KPS)
     if VQB == 4:
         vb_idx = d_offs // 2
         vb_shift = (d_offs % 2) * 4
@@ -651,7 +658,7 @@ def _tq_full_dequant_kv(
         )
         v_idx = ((val_raw >> vb_shift) & 0xF).to(tl.float32)
 
-        sc_base = val_base + VAL_DATA_BYTES
+        sc_base = slot_base + KPS + VAL_DATA_BYTES
         sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
         sc_hi = tl.load(KV_cache_ptr + sc_base + 1).to(tl.uint16)
         v_scale = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
@@ -673,7 +680,7 @@ def _tq_full_dequant_kv(
         raw16_val = val_raw0 | (val_raw1 << 8)
         v_idx = ((raw16_val >> val_bit_shift) & 0x7).to(tl.float32)
 
-        sc_base = val_base + VAL_DATA_BYTES
+        sc_base = slot_base + KPS + VAL_DATA_BYTES
         sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
         sc_hi = tl.load(KV_cache_ptr + sc_base + 1).to(tl.uint16)
         v_scale = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
@@ -793,12 +800,9 @@ def triton_turboquant_decode_attention(
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
     BLOCK_KV = block_kv
     HEAD_GROUP = 6 if kv_group_size % 6 == 0 else 1
-    use_six_scalar = (
-        BLOCK_KV == 2
-        and Hq == 24
-        and Hk == 4
+    aligned_spec_layout = (
+        Hk == 4
         and D == 256
-        and kv_group_size == 6
         and mse_bits == 4
         and cfg["mse_bytes"] == 128
         and key_packed_size == 130
@@ -806,6 +810,13 @@ def triton_turboquant_decode_attention(
         and cfg["val_data_bytes"] == 128
         and not key_fp8
         and norm_correction
+        and kv_cache.shape[3] == 268
+    )
+    use_six_scalar = (
+        aligned_spec_layout
+        and BLOCK_KV == 2
+        and Hq == 24
+        and kv_group_size == 6
     )
     use_native_head_parallel = (
         use_six_scalar
@@ -933,6 +944,7 @@ def triton_turboquant_decode_attention(
             KPS=key_packed_size,
             VQB=value_quant_bits,
             VAL_DATA_BYTES=cfg["val_data_bytes"],
+            ALIGNED_SPEC_LAYOUT=aligned_spec_layout,
             ATTN_SCALE=scale,
             BLOCK_D=cfg["BLOCK_D"],
             BLOCK_KV=BLOCK_KV,

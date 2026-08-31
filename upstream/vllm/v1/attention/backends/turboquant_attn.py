@@ -9,11 +9,12 @@ Decode:  Compute TQ attention scores from compressed cache,
 
 Cache layout (no leading 2 dimension):
   (num_blocks, block_size, num_kv_heads, slot_size)
-  where slot_size = key_packed_size + value_fp16_size
+  where slot_size = key_packed_size + value_packed_size
 
 Per-head per-position slot layout:
-  [key_packed (kps bytes) | value_fp16 (D*2 bytes)]
-  For turboquant_k3v4_nc head_dim=256: [100 bytes key | 512 bytes value] = 612
+  Generic: [key_packed (kps bytes) | value_packed]
+  D256/MSE4/V4/NC: [128-B key indices | 128-B value data | 2-B key norm |
+                    4-B value metadata | 2-B pad | 4-B cached inverse norm]
 """
 
 import functools
@@ -163,7 +164,9 @@ class TurboQuantAttentionBackend(AttentionBackend):
 
             (num_blocks, num_kv_heads, block_size, slot_size_aligned)
 
-        Each slot = [key_packed | value_packed | padding].
+        Each generic slot is [key_packed | value_packed | padding]. The
+        specialized 268-byte layout reorders value data before the key norm to
+        keep both packed payloads four-byte aligned without changing capacity.
         This is safe because TQ has its own get_kv_cache_shape override and
         never shares cache tensors with other backends. Layers that fall back
         to native dtype via kv_cache_dtype_skip_layers get their own
@@ -496,6 +499,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             KPS=cfg.key_packed_size,
             VQB=cfg.effective_value_quant_bits,
             VAL_DATA_BYTES=self._val_data_bytes,
+            ALIGNED_SPEC_LAYOUT=(
+                D == 256
+                and Hk == 4
+                and cfg.key_mse_bits == 4
+                and cfg.key_packed_size == 130
+                and cfg.effective_value_quant_bits == 4
+                and not cfg.key_fp8
+                and cfg.norm_correction
+                and kv_cache.shape[3] == TURBOQUANT_SPEC_SLOT_SIZE_BYTES
+            ),
             MSE_BITS=cfg.key_mse_bits,
             KEY_FP8=1 if cfg.key_fp8 else 0,
             BLOCK_D=triton.next_power_of_2(D),
@@ -1041,6 +1054,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             KPS=self.tq_config.key_packed_size,
             VQB=self.tq_config.effective_value_quant_bits,
             VAL_DATA_BYTES=val_data_bytes,
+            ALIGNED_SPEC_LAYOUT=(
+                D == 256
+                and Hk == 4
+                and self.tq_config.key_mse_bits == 4
+                and self.tq_config.key_packed_size == 130
+                and self.tq_config.effective_value_quant_bits == 4
+                and not self.tq_config.key_fp8
+                and self.tq_config.norm_correction
+                and kv_cache.shape[3] == TURBOQUANT_SPEC_SLOT_SIZE_BYTES
+            ),
             MSE_BITS=self.tq_config.key_mse_bits,
             KEY_FP8=1 if self.tq_config.key_fp8 else 0,
             BLOCK_D=BLOCK_D,

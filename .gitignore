@@ -1,4 +1,5 @@
 release-assets/
 benchmarks/data/
-benchmarks/results/
+benchmarks/results/throughput/
+benchmarks/results/tool-calls/
 *.whl

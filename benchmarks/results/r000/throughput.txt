@@ -1,0 +1,71 @@
+[bench] Using unified server at http://127.0.0.1:8000 (externally managed; it will not be stopped)
+[bench] NOTE: this server exposes vLLM prefix-cache metrics; if automatic
+[bench]   prefix caching is enabled (V1 default), pp t/s of repeated prompts
+[bench]   benefits from KV hits and is optimistic. For cold-cache numbers
+[bench]   restart vLLM with --no-enable-prefix-caching and re-run.
+[bench]   Live hit counter: curl -s http://127.0.0.1:8000/metrics | grep vllm:prefix_cache_hits_total
+[bench] Throughput benchmark: model=qwen38-nvfp4 base_url=http://127.0.0.1:8000 pp=2048 tg=128
+[bench]   depths=0,4096,8192,16384,32768,65536 concurrency=1,2,4 timeout=300s (one sample per point)
+[bench]   Unified server target: max-model-len=262144, max-num-seqs=4.
+[bench]   At deep context the server may admit four requests but process them sequentially
+[bench]   when the active KV/memory budget cannot keep all four resident concurrently.
+[bench]   Client pp t/s / TTFT are first-SSE-event artifacts (vLLM emits its
+[bench]   first SSE event on request acceptance, not when
+[bench]   prefill finishes) — use them for the tg sweep shape, and cross-check
+[bench]   real prefill/decode against the server logs or a raw HTTP timing.
+  ✓ Warm-up complete (143 ms)
+
+╭────────────────────────── ⚡ Throughput Benchmark ───────────────────────────╮
+│ qwen38-nvfp4                                                                 │
+│ pp=2048  tg=128  depth=[0, 4096, 8192, 16384, 32768, 65536]  concurrency=[1, │
+│ 2, 4]                                                                        │
+╰──────────────────────────────────────────────────────────────────────────────╯
+Speculative decoding detected on server (method: draft_model). Standard tg t/s under-reports real throughput for spec-decode models. Run with --spec-bench to measure acceptance rate and effective t/s.
+  ✓ pp2048 @ d0 c1  4,296 pp t/s  99.3 tg t/s  ttft=492ms  total=1,772ms
+  ✓ pp2048 @ d0 c2  2,946 pp t/s  129.7 tg t/s  ttft=718ms  total=1,974ms
+  ✓ pp2048 @ d0 c4  2,832 pp t/s  219.7 tg t/s  ttft=817ms  total=2,330ms
+  ✓ pp2048 @ d4096 c1  7,893 pp t/s  108.0 tg t/s  ttft=785ms  total=1,962ms
+  ✓ pp2048 @ d4096 c2  6,095 pp t/s  86.2 tg t/s  ttft=1,084ms  total=2,969ms
+  ✓ pp2048 @ d4096 c4  4,366 pp t/s  125.0 tg t/s  ttft=1,683ms  total=4,096ms
+  ✓ pp2048 @ d8192 c1  9,076 pp t/s  67.7 tg t/s  ttft=1,134ms  total=3,010ms
+  ✓ pp2048 @ d8192 c2  6,553 pp t/s  62.1 tg t/s  ttft=1,701ms  total=4,122ms
+  ✓ pp2048 @ d8192 c4  4,609 pp t/s  81.6 tg t/s  ttft=2,733ms  total=6,276ms
+  ✓ pp2048 @ d16384 c1  9,146 pp t/s  71.1 tg t/s  ttft=2,019ms  total=3,807ms
+  ✓ pp2048 @ d16384 c2  6,587 pp t/s  41.1 tg t/s  ttft=3,106ms  total=6,231ms
+  ✓ pp2048 @ d16384 c4  4,486 pp t/s  45.3 tg t/s  ttft=5,313ms  total=11,305ms
+  ✓ pp2048 @ d32768 c1  8,341 pp t/s  43.9 tg t/s  ttft=4,178ms  total=7,071ms
+  ✓ pp2048 @ d32768 c2  5,841 pp t/s  20.2 tg t/s  ttft=6,798ms  total=12,644ms
+  ✓ pp2048 @ d32768 c4  3,915 pp t/s  22.3 tg t/s  ttft=12,015ms  total=22,979ms
+  ✓ pp2048 @ d65536 c1  6,544 pp t/s  29.0 tg t/s  ttft=10,328ms  total=14,708ms
+  ✓ pp2048 @ d65536 c2  4,682 pp t/s  9.4 tg t/s  ttft=16,612ms  total=27,301ms
+  ✓ pp2048 @ d65536 c4  3,112 pp t/s  9.3 tg t/s  ttft=30,316ms  total=55,126ms
+
+                               Throughput Results                               
+┏━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━┓
+┃                        ┃         ┃          ┃    TTFT ┃    Total ┃           ┃
+┃ Test                   ┃  pp t/s ┃   tg t/s ┃    (ms) ┃     (ms) ┃    Tokens ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━┩
+│ pp2048 tg128 @ d0      │   4,296 │     99.3 │     492 │    1,772 │  2115+128 │
+│ pp2048 tg256 @ d0  c2  │   2,946 │    129.7 │     718 │    1,974 │  2115+256 │
+│ pp2048 tg512 @ d0  c4  │   2,832 │    219.7 │     817 │    2,330 │  2115+512 │
+│ pp2048 tg128 @ d4096   │   7,893 │    108.0 │     785 │    1,962 │  6194+128 │
+│ pp2048 tg256 @ d4096 … │   6,095 │     86.2 │   1,084 │    2,969 │  6194+256 │
+│ pp2048 tg512 @ d4096 … │   4,366 │    125.0 │   1,683 │    4,096 │  6194+512 │
+│ pp2048 tg128 @ d8192   │   9,076 │     67.7 │   1,134 │    3,010 │ 10289+128 │
+│ pp2048 tg256 @ d8192 … │   6,553 │     62.1 │   1,701 │    4,122 │ 10289+256 │
+│ pp2048 tg512 @ d8192 … │   4,609 │     81.6 │   2,733 │    6,276 │ 10289+512 │
+│ pp2048 tg128 @ d16384  │   9,146 │     71.1 │   2,019 │    3,807 │ 18469+128 │
+│ pp2048 tg256 @ d16384… │   6,587 │     41.1 │   3,106 │    6,231 │ 18469+256 │
+│ pp2048 tg512 @ d16384… │   4,486 │     45.3 │   5,313 │   11,305 │ 18469+512 │
+│ pp2048 tg128 @ d32768  │   8,341 │     43.9 │   4,178 │    7,071 │ 34846+128 │
+│ pp2048 tg256 @ d32768… │   5,841 │     20.2 │   6,798 │   12,644 │ 34846+256 │
+│ pp2048 tg512 @ d32768… │   3,915 │     22.3 │  12,015 │   22,979 │ 34846+512 │
+│ pp2048 tg128 @ d65536  │   6,544 │     29.0 │  10,328 │   14,708 │ 67586+128 │
+│ pp2048 tg256 @ d65536… │   4,682 │      9.4 │  16,612 │   27,301 │ 67586+256 │
+│ pp2048 tg512 @ d65536… │   3,112 │      9.3 │  30,316 │   55,126 │ 67586+512 │
+└────────────────────────┴─────────┴──────────┴─────────┴──────────┴───────────┘
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ ⚡ Speculative decoding detected (draft_model)                               │
+│ Standard tg t/s under-reports real throughput for spec-decode models.        │
+│ Re-run with --spec-bench for acceptance rate (α) and effective t/s.          │
+╰──────────────────────────────────────────────────────────────────────────────╯

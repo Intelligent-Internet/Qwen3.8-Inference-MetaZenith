@@ -153,6 +153,8 @@ tool-call quality against a running OpenAI-compatible endpoint. See
 server requirements, workload controls, and result locations. The exact r107
 server and workload configuration is preserved in
 [`benchmarks/profiles/r107-sm120.md`](benchmarks/profiles/r107-sm120.md).
+Plain-text terminal logs for R000 and R107 are available in
+[`benchmarks/results/`](benchmarks/results/README.md).
 
 ## Installation
 

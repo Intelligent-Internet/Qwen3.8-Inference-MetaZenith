@@ -87,3 +87,6 @@ server flags, throughput grid, tool-call settings, and comparison methodology
 used for the r107 RTX 5090 evaluation. Use that profile when reproducing the
 published optimization setup; use environment overrides only for exploratory
 runs.
+
+The cleaned terminal logs for both the R000 baseline and R107 champion are
+available under [`results/`](results/README.md) for direct comparison.

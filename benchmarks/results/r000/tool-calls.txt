@@ -1,0 +1,80 @@
+[bench] Using unified server at http://127.0.0.1:8000 (externally managed; it will not be stopped)
+[bench] Standard tool-call benchmark: model=qwen38-nvfp4 base_url=http://127.0.0.1:8000
+[bench]   seed=42 trials=1 parallel=1 timeout=300s (fixed 15-scenario short suite)
+  ✓ Warm-up complete (144 ms)
+
+╭─────────────────────────── 🔧 Tool-Call Benchmark ───────────────────────────╮
+│ qwen38-nvfp4  via vllm @ http://127.0.0.1:8000                               │
+│ 15 scenarios  v2.5.1.dev46+gd4381ce5c                                        │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+  ● TC-01  Direct Specialist Match         ✅ PASS  2/2   2.6s  ttft=201ms t2  
+Used get_weather with Berlin only.
+  ● TC-02  Distractor Resistance           ✅ PASS  2/2   2.7s  ttft=196ms t2  
+Used only get_stock_price for AAPL.
+  ● TC-03  Implicit Tool Need              ✅ PASS  2/2   3.5s  ttft=189ms t3  
+Looked up Sarah before sending the email.
+  ● TC-04  Unit Handling                   ✅ PASS  2/2   1.9s  ttft=194ms t2  
+Requested Tokyo weather in Fahrenheit explicitly.
+  ● TC-05  Date and Time Parsing           ✅ PASS  2/2   5.4s  ttft=194ms t3  
+Parsed next Monday and included the requested meeting details.
+  ● TC-06  Multi-Value Extraction          ✅ PASS  2/2   2.9s  ttft=196ms t2  
+Issued separate translate_text calls for both languages.
+  ● TC-07  Search → Read → Act             ✅ PASS  2/2   6.4s  ttft=196ms t4  
+Completed the full four-step chain with the right data.
+  ● TC-08  Conditional Branching           ✅ PASS  2/2   5.3s  ttft=195ms t3  
+Checked the weather first, then set the rainy-day reminder.
+  ● TC-09  Parallel Independence           ✅ PASS  2/2   4.4s  ttft=194ms t2  
+Handled both independent tasks.
+  ● TC-10  Trivial Knowledge               ✅ PASS  2/2   0.9s  ttft=191ms  
+Answered directly without tool use.
+  ● TC-11  Simple Math                     ✅ PASS  2/2   1.1s  ttft=197ms  Did 
+the math directly — good restraint.
+  ● TC-12  Impossible Request              ✅ PASS  2/2   4.8s  ttft=197ms  
+Refused cleanly because no delete-email tool exists.
+  ● TC-13  Empty Results                   ✅ PASS  2/2   4.6s  ttft=195ms t4  
+Retried after the empty result and recovered.
+  ● TC-14  Malformed Response              ⚠️  PARTIAL  1/2   2.4s  ttft=195ms 
+t2  Acknowledged the error but did not attempt an alternative source.
+  ● TC-15  Conflicting Information         ✅ PASS  2/2   2.8s  ttft=194ms t3  
+Used the searched population value in the calculator.
+
+                               Category Breakdown                               
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┓
+┃ Category                  ┃   Score   ┃ Bar                       ┃  Earned  ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━┩
+│ Tool Selection            │   100%    │ ████████████████████      │   6/6    │
+│ Parameter Precision       │   100%    │ ████████████████████      │   6/6    │
+│ Multi-Step Chains         │   100%    │ ████████████████████      │   6/6    │
+│ Restraint & Refusal       │   100%    │ ████████████████████      │   6/6    │
+│ Error Recovery            │    83%    │ ████████████████░░░░      │   5/6    │
+└───────────────────────────┴───────────┴───────────────────────────┴──────────┘
+
+╭─────────────────────────── 🏆 Benchmark Complete ────────────────────────────╮
+│                                                                              │
+│    Model:  qwen38-nvfp4                                                      │
+│    Score:  97 / 100                                                          │
+│    Rating: ★★★★★ Excellent                                                   │
+│    Benchmark: tool-eval-bench v2.5.1.dev46+gd4381ce5c                        │
+│                                                                              │
+│    ✅ 14 passed   ⚠️  1 partial   ❌ 0 failed                                │
+│    Points: 29/30                                                             │
+│                                                                              │
+│    Quality:        97/100                                                    │
+│    Responsiveness: 81/100  (median turn: 1.2s)                               │
+│    Deployability:  92/100  (α=0.7)                                           │
+│    Weakest: E Error Recovery (83%)                                           │
+│                                                                              │
+│    Completed in 52.0s                                                        │
+│                                                                              │
+│    📊 Token Usage:                                                           │
+│    Total: 71,335 tokens  │  Efficiency: 0.4 pts/1K tokens                    │
+│                                                                              │
+│    ── How this score is calculated ──                                        │
+│    • Each scenario: pass=2pt, partial=1pt, fail=0pt                          │
+│    • Category %: earned / max per category                                   │
+│    • Final score: (total points / max points) × 100                          │
+│    • Deployability: 0.7×quality + 0.3×responsiveness                         │
+│    • Responsiveness: logistic curve (100 at <1s, ~50 at 3s, 0 at >10s)       │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯

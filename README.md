@@ -140,9 +140,19 @@ cache integration.
 ## Repository layout
 
 - `upstream/` — the vendored vLLM source tree and all optimized runtime code.
+- `benchmarks/` — reproducible throughput and tool-call benchmark wrappers.
 - `pyproject.toml` — the local editable-build environment definition.
 - `uv.lock` — the frozen Python dependency resolution used during development.
 - `LICENSE` — the retained Apache License 2.0.
+
+## Benchmarks
+
+The release includes client-side scripts for measuring serving throughput and
+tool-call quality against a running OpenAI-compatible endpoint. See
+[`benchmarks/README.md`](benchmarks/README.md) for the pinned benchmark client,
+server requirements, workload controls, and result locations. The exact r107
+server and workload configuration is preserved in
+[`benchmarks/profiles/r107-sm120.md`](benchmarks/profiles/r107-sm120.md).
 
 ## Installation
 

@@ -147,6 +147,13 @@ cache integration.
 
 ## Benchmarks
 
+The following comparison shows single-request (`c1`) generation throughput for
+the R000 baseline and the R107 release across the fixed `pp2048 / tg128`
+context-depth sweep. Values are aggregate generated tokens per second; the
+annotations report R107 speedup relative to R000.
+
+![R000 versus R107 single-request generation throughput](docs/assets/r000-vs-r107-c1.png)
+
 The release includes client-side scripts for measuring serving throughput and
 tool-call quality against a running OpenAI-compatible endpoint. See
 [`benchmarks/README.md`](benchmarks/README.md) for the pinned benchmark client,

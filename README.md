@@ -1,3 +1,5 @@
+![Meta-Zenith Qwen3.8 inference benchmark](docs/assets/main.png)
+
 # Optimized Qwen3.8 NVFP4 Inference on RTX 5090
 
 This repository contains a specialized vLLM source tree for serving

@@ -1,40 +1,238 @@
-# Installing the Optimized Qwen3.8 Build
+# Optimized Qwen3.8 NVFP4 Inference on RTX 5090
 
-This directory contains the optimized vLLM source and production launcher for
-`RadixArk/Qwen3.8-27B-NVFP4` on one NVIDIA RTX 5090.
+This repository contains a specialized vLLM source tree for serving
+`RadixArk/Qwen3.8-27B-NVFP4` on a single NVIDIA GeForce RTX 5090 (`sm_120`).
+It is the result of an iterative optimization effort focused on exact
+inference, long-context serving, speculative decoding, and the model's
+TurboQuant and Gated Delta Network (GDN) execution paths.
 
-The selected version is R107 on the `champion-r107` branch.
+This is not a general replacement for upstream vLLM. The current code is a
+hardware- and workload-specific fork whose primary target is:
 
-## 1. Select the branch
+- Model: `RadixArk/Qwen3.8-27B-NVFP4`
+- GPU: one NVIDIA GeForce RTX 5090
+- CUDA architecture: `sm_120`
+- Quantization: NVFP4 weights with TurboQuant 4-bit KV cache
+- Speculative decoding: the model's MTP path
+- Long-context inference: up to 262,144 tokens in the optimized workload
 
-```bash
-cd /root/qwen3_optimze_inference
-git switch champion-r107
-```
+Serving, validation, and benchmark documentation will be added after the
+source and release interface have been reviewed.
 
-## 2. Prepare the model
+## Starting point
 
-By default, the server loads the model from:
+The initial baseline is recorded by the first commit in this repository. It
+was built from:
+
+- [vLLM](https://github.com/vllm-project/vllm) tag `v0.27.1`
+- Upstream commit `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac`
+- The TurboQuant MTP K+1 verification-routing correction from upstream
+  [PR #40914](https://github.com/vllm-project/vllm/pull/40914)
+
+That routing correction was the only source-level deviation from the vLLM tag
+in the baseline. It prevents context-blind CUDA Graph capture and incorrect
+outputs when MTP is used with the 4-bit KV cache.
+
+The baseline used one editable local vLLM build and a fixed serving workload so
+that later experiments changed the inference implementation without silently
+changing the model, server configuration, or dependency environment.
+
+## Optimization journey
+
+The commits after the baseline preserve the progression from isolated decode
+changes to a composed inference pipeline. The main stages are summarized below
+in chronological order.
+
+### 1. TurboQuant decode working set and context-aware dispatch
+
+The first changes reduced the token-tile working set of the Triton TurboQuant
+decode kernel and selected different decode layouts according to context
+length. CUDA Graph dispatch was then made aware of the same context regimes so
+that short- and long-context paths could be captured safely.
+
+This stage introduced:
+
+- Smaller decode tiles to reduce per-launch working data.
+- Context-dependent TurboQuant kernel selection.
+- Full CUDA Graph capture boundaries aligned with kernel dispatch boundaries.
+- Composition of the TurboQuant GQA decode path with full graphs.
+- A specialized six-head KV reduction path for the target model layout.
+
+### 2. NVFP4 output projection and speculative GDN input handling
+
+The next stage optimized work around the attention kernels:
+
+- Small language-model-head workloads are dispatched to the FlashInfer B12x
+  NVFP4 GEMM path when supported.
+- The speculative GDN update reads Q, K, and V directly from the packed QKV
+  representation instead of materializing equivalent intermediate tensors.
+
+These changes reduce conversion and materialization overhead in the small,
+latency-sensitive operations surrounding decode.
+
+### 3. Native exact TurboQuant decode kernels
+
+Two CUDA implementations were added for exact TurboQuant decode:
+
+- A head-parallel kernel for context regimes where independent head work is
+  preferable.
+- A shared high-batch kernel that reuses dequantized KV data across compatible
+  requests and heads.
+
+The dispatcher selects between these implementations and the Triton paths
+using batch shape, context length, KV layout, and speculative-decoding state.
+The kernels were subsequently composed with the full CUDA Graph pipeline.
+
+### 4. Direct-output paths and GDN prefill on Blackwell
+
+Several intermediate output copies were removed by allowing attention and GDN
+operations to write directly into their final output buffers. The pure-prefill
+GDN path was enabled through FlashInfer on `sm_120`, while speculative GDN
+updates retained an exact packed-input implementation.
+
+This stage focused on eliminating redundant memory traffic while preserving the
+same inference results.
+
+### 5. Batched-prefill scheduling and KV-cache preparation
+
+The serving pipeline was adjusted so optimized kernels receive suitable memory
+and scheduling conditions:
+
+- Hybrid KV-cache capacity is reserved for batched prefills.
+- FlashInfer tuning runs before KV-cache allocation where supported.
+- Long prefill chunks adapt to the active requests' fair share of the token
+  budget instead of relying only on a fixed threshold.
+
+These changes target mixed decode/prefill workloads and reduce avoidable
+contention between long prompts.
+
+### 6. Exact prefill fusion
+
+The GDN prefill path was progressively fused into the surrounding operations:
+
+- Convolution outputs are routed directly into the GDN prefill computation.
+- Q/K normalization is performed inside the fused path.
+- NVFP4 activation quantization and GDN prefill outputs are composed into the
+  same optimized pipeline where the target shapes allow it.
+
+The goal is to avoid round trips through temporary tensors between convolution,
+normalization, quantization, and recurrent-attention preparation.
+
+### 7. TurboQuant layout and high-batch refinements
+
+The final optimization stage tightened the specialized TurboQuant paths:
+
+- Reused layout proofs and cached norm information outside repeated inner work.
+- Rebalanced long-context B4 splits.
+- Vectorized packed B4 KV loads.
+- Warmed the continuation-prefill dequantization and inverse-rotation path.
+- Shortened score lifetimes in the B16 shared kernel to reduce register
+  pressure.
+- Aligned the packed value payload and slot ABI across store, dispatch, Triton,
+  and CUDA implementations.
+
+At the current revision, the optimization delta relative to the recorded
+baseline touches 24 upstream source files, with approximately 3,309 inserted
+lines and 186 removed lines. Most of that delta is concentrated in TurboQuant
+decode, GDN prefill/speculative decode, CUDA Graph dispatch, and scheduler/KV
+cache integration.
+
+## Repository layout
+
+- `upstream/` — the vendored vLLM source tree and all optimized runtime code.
+- `pyproject.toml` — the local editable-build environment definition.
+- `uv.lock` — the frozen Python dependency resolution used during development.
+- `LICENSE` — the retained Apache License 2.0.
+
+## Installation
+
+The first supported build profile is intentionally narrow:
+
+- Ubuntu 24.04 or another `x86_64` Linux distribution with glibc 2.38 or
+  newer.
+- Python 3.12.
+- NVIDIA GeForce RTX 5090, compute capability 12.0 (`sm_120`).
+- An NVIDIA driver compatible with CUDA 13.0.
+- CUDA Toolkit 13.0 with `nvcc` only when building from source.
+- The PyTorch and Python dependency versions recorded in `uv.lock`.
+
+Other environments may work, but they have not yet been included in the
+release validation matrix.
+
+### Pre-built artifacts
+
+The pre-built wheel is the recommended installation method because compiling
+the vendored vLLM CUDA extensions can take a long time. The first validated
+artifact is:
 
 ```text
-/root/models/RadixArk/Qwen3.8-27B-NVFP4
+vllm-0.27.1+qwen38.r107.cu130.sm120-cp312-cp312-linux_x86_64.whl
 ```
 
-If the model is stored elsewhere, you do not need to edit the source. Pass its
-location through `MODEL_DIR` when starting the server, as shown in section 4.
+It targets CPython 3.12, CUDA 13.0, and `sm_120`. It was built on Ubuntu 24.04
+and requires glibc 2.38 or newer. Installing the wheel does not require the
+CUDA Toolkit or `nvcc`; the machine still needs a compatible NVIDIA driver.
 
-## 3. Install from source
-
-The machine must have:
-
-- An NVIDIA driver and CUDA toolkit with `nvcc` available.
-- Git and uv.
-- Python 3.12. If it is unavailable, run `uv python install 3.12`.
-
-Install the project with:
+Download the wheel from the matching GitHub release, place it beside this
+checkout, and install the exact dependency set tested with that artifact:
 
 ```bash
-cd /root/qwen3_optimze_inference/src
+git clone <REPOSITORY_URL>
+cd <REPOSITORY_DIRECTORY>
+
+uv venv --python 3.12
+uv pip sync requirements-prebuilt.txt
+uv pip install --no-deps \
+  ./vllm-0.27.1+qwen38.r107.cu130.sm120-cp312-cp312-linux_x86_64.whl
+```
+
+Use the virtual environment directly so that the project manager does not try
+to replace the wheel with the editable source dependency:
+
+```bash
+.venv/bin/python - <<'PY'
+import torch
+import vllm
+
+print("vLLM:", vllm.__version__)
+print("PyTorch:", torch.__version__)
+print("CUDA runtime:", torch.version.cuda)
+print("GPU:", torch.cuda.get_device_name())
+print("Compute capability:", torch.cuda.get_device_capability())
+PY
+```
+
+The expected vLLM version is
+`0.27.1+qwen38.r107.cu130.sm120`, and the compute capability must be `(12, 0)`.
+For subsequent commands, call executables through `.venv/bin/`, or use
+`uv run --no-sync`; a plain `uv run` may synchronize the editable source build.
+
+Verify the downloaded file against `SHA256SUMS` from the same release before
+installing it. Do not substitute an upstream vLLM wheel: this fork changes C++
+and CUDA code, so upstream pre-built extensions do not contain the optimized
+kernels.
+
+### Build from source
+
+Install the following system prerequisites:
+
+- A recent NVIDIA driver that supports the installed CUDA 13 runtime.
+- CUDA Toolkit 13.0, including `nvcc`.
+- GCC and G++ 11.3 or newer.
+- Git and [uv](https://docs.astral.sh/uv/).
+
+Confirm that the GPU and compiler are visible:
+
+```bash
+nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader
+nvcc --version
+```
+
+Clone the repository, then build the locked environment:
+
+```bash
+git clone <REPOSITORY_URL>
+cd <REPOSITORY_DIRECTORY>
 
 export TORCH_CUDA_ARCH_LIST=12.0
 export MAX_JOBS=8
@@ -44,86 +242,51 @@ export VLLM_VERSION_OVERRIDE=0.27.1
 uv sync --frozen
 ```
 
-`uv sync --frozen` creates `src/.venv`, installs the exact dependencies from
-`uv.lock`, and builds vLLM from the optimized source in `src/upstream`.
+`uv sync --frozen` creates `.venv`, installs the exact dependency resolution
+from `uv.lock`, and builds the optimized vLLM source in `upstream/` as an
+editable local dependency. Do not run a separate `pip install vllm`, because
+that can replace the optimized local build with an upstream package.
 
-Do not run an additional `pip install vllm` command.
+`MAX_JOBS` and `NVCC_THREADS` control build parallelism. The values above were
+used on the development machine; reduce them if compilation exhausts system
+memory.
 
-### Why is `TORCH_CUDA_ARCH_LIST` set to `12.0`?
-
-This value is correct for the machine used to optimize and validate the build:
-
-```text
-GPU: NVIDIA GeForce RTX 5090
-Compute capability: 12.0
-CUDA architecture: sm_120
-```
-
-Therefore, `TORCH_CUDA_ARCH_LIST=12.0` instructs the compiler to generate code
-for the RTX 5090. When installing on a different GPU, use that GPU's compute
-capability instead of copying `12.0` unchanged.
-
-Check the current GPU with:
+Verify the resulting environment:
 
 ```bash
-nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader
+uv run python - <<'PY'
+import torch
+import vllm
+
+print("vLLM:", vllm.__file__)
+print("PyTorch:", torch.__version__)
+print("CUDA runtime:", torch.version.cuda)
+print("GPU:", torch.cuda.get_device_name())
+print("Compute capability:", torch.cuda.get_device_capability())
+PY
 ```
 
-## 4. Start the server
+The vLLM module path must resolve inside this checkout's `upstream/` directory,
+and the reported compute capability must be `(12, 0)` for the validated RTX
+5090 profile.
 
-If the model is in the default location:
+### CUDA version versus compute capability
 
-```bash
-cd /root/qwen3_optimze_inference/src
-./start.sh
-```
+`CUDA 13.0` and `sm_120` describe different things:
 
-If the model is stored elsewhere:
+- **CUDA 13.0** is the compiler/toolkit and runtime generation.
+- **12.0** in `TORCH_CUDA_ARCH_LIST=12.0` is the GPU compute capability and
+  produces code for `sm_120`.
 
-```bash
-cd /root/qwen3_optimze_inference/src
-MODEL_DIR=/path/to/model ./start.sh
-```
+The current CUDA 13.0 compiler and this vLLM source tree support Blackwell
+targets through `sm_121`; they do not define an `sm_130` target. Therefore,
+`TORCH_CUDA_ARCH_LIST="12.0 13.0"` is not a valid build configuration for this
+release.
 
-The server uses:
-
-- Address: `http://127.0.0.1:8000`
-- API model name: `qwen38-nvfp4`
-- Maximum context length: `262144` tokens
-- Maximum concurrency: `4`
-- MTP: `3` speculative tokens
-
-## 5. Test the server
-
-In another terminal, run:
-
-```bash
-curl -f http://127.0.0.1:8000/health
-curl -s http://127.0.0.1:8000/v1/models
-```
-
-Send a test request:
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "qwen38-nvfp4",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "temperature": 0,
-    "max_tokens": 64
-  }'
-```
-
-## Optimized version
-
-```text
-Branch: champion-r107
-R107 commit: f4a6d9b0181749dae5475b6cc2c5d1ce1b751f14
-Fixed-grid score: 84.89430291791149
-MMLU-Pro: 57/64
-Tool quality: 97/100
-```
-
-The optimized source on this branch is based on R107 commit
-`f4a6d9b0181749dae5475b6cc2c5d1ce1b751f14`.
+A wheel may contain code for multiple supported compute capabilities by using
+a space-separated architecture list, for example `"12.0 12.1"`. Such a build
+is larger, takes longer to compile, and still requires correctness and
+performance testing on every included GPU. The optimized path in this
+repository has currently been validated only on `sm_120`, so the first release
+will use a dedicated `sm_120` binary rather than an unvalidated multi-GPU
+wheel.

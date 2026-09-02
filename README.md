@@ -154,7 +154,8 @@ The first supported build profile is intentionally narrow:
 - NVIDIA GeForce RTX 5090, compute capability 12.0 (`sm_120`).
 - An NVIDIA driver compatible with CUDA 13.0.
 - CUDA Toolkit 13.0 with `nvcc` only when building from source.
-- The PyTorch and Python dependency versions recorded in `uv.lock`.
+- The dependency versions recorded in `requirements-prebuilt.txt` for the
+  wheel, or `uv.lock` for a source build.
 
 Other environments may work, but they have not yet been included in the
 release validation matrix.
@@ -173,17 +174,31 @@ It targets CPython 3.12, CUDA 13.0, and `sm_120`. It was built on Ubuntu 24.04
 and requires glibc 2.38 or newer. Installing the wheel does not require the
 CUDA Toolkit or `nvcc`; the machine still needs a compatible NVIDIA driver.
 
-Download the wheel from the matching GitHub release, place it beside this
-checkout, and install the exact dependency set tested with that artifact:
+Install Git, `curl`, and [uv](https://docs.astral.sh/uv/), then run the commands
+below. Cloning the release tag ensures that `requirements-prebuilt.txt` matches
+the wheel:
 
 ```bash
-git clone <REPOSITORY_URL>
-cd <REPOSITORY_DIRECTORY>
+RELEASE_TAG=v0.27.1-qwen38-r107-cu130-sm120
+WHEEL=vllm-0.27.1+qwen38.r107.cu130.sm120-cp312-cp312-linux_x86_64.whl
+
+git clone --branch "$RELEASE_TAG" --depth 1 \
+  https://github.com/Intelligent-Internet/Qwen3.8-Inference-AutoResearch.git
+cd Qwen3.8-Inference-AutoResearch
+
+mkdir -p release-assets
+curl -fL \
+  "https://github.com/Intelligent-Internet/Qwen3.8-Inference-AutoResearch/releases/download/$RELEASE_TAG/vllm-0.27.1%2Bqwen38.r107.cu130.sm120-cp312-cp312-linux_x86_64.whl" \
+  -o "release-assets/$WHEEL"
+curl -fL \
+  "https://github.com/Intelligent-Internet/Qwen3.8-Inference-AutoResearch/releases/download/$RELEASE_TAG/SHA256SUMS" \
+  -o release-assets/SHA256SUMS
+
+(cd release-assets && sha256sum -c SHA256SUMS)
 
 uv venv --python 3.12
 uv pip sync requirements-prebuilt.txt
-uv pip install --no-deps \
-  ./vllm-0.27.1+qwen38.r107.cu130.sm120-cp312-cp312-linux_x86_64.whl
+uv pip install --no-deps "release-assets/$WHEEL"
 ```
 
 Use the virtual environment directly so that the project manager does not try
@@ -207,10 +222,9 @@ The expected vLLM version is
 For subsequent commands, call executables through `.venv/bin/`, or use
 `uv run --no-sync`; a plain `uv run` may synchronize the editable source build.
 
-Verify the downloaded file against `SHA256SUMS` from the same release before
-installing it. Do not substitute an upstream vLLM wheel: this fork changes C++
-and CUDA code, so upstream pre-built extensions do not contain the optimized
-kernels.
+The `sha256sum` step must report the wheel as `OK`. Do not substitute an
+upstream vLLM wheel: this fork changes C++ and CUDA code, so upstream pre-built
+extensions do not contain the optimized kernels.
 
 ### Build from source
 
@@ -231,8 +245,8 @@ nvcc --version
 Clone the repository, then build the locked environment:
 
 ```bash
-git clone <REPOSITORY_URL>
-cd <REPOSITORY_DIRECTORY>
+git clone https://github.com/Intelligent-Internet/Qwen3.8-Inference-AutoResearch.git
+cd Qwen3.8-Inference-AutoResearch
 
 export TORCH_CUDA_ARCH_LIST=12.0
 export MAX_JOBS=8

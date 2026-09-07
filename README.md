@@ -156,6 +156,32 @@ annotations report R107 speedup relative to R000.
 
 ![R000 versus R107 single-request generation throughput](docs/assets/r000-vs-r107-c1.png)
 
+The full 18-cell grid (`pp2048 / tg128`, context depths 0 to 65,536,
+concurrency 1, 2, and 4) is listed below. Values are the client-observed
+aggregate `tg t/s` for each cell and include prefill time; the geometric mean
+across all cells improves from 51.9 to 84.9 (+63.5%).
+
+| Context | Concurrency | `R000` tg/s | `R107` tg/s | Delta |
+| --- | --- | --- | --- | --- |
+| 0 | 1 | 99.3 | 185.5 | +86.81% |
+| 0 | 2 | 129.7 | 215.2 | +65.92% |
+| 0 | 4 | 219.7 | 297.7 | +35.50% |
+| 4,096 | 1 | 108.0 | 121.0 | +12.04% |
+| 4,096 | 2 | 86.2 | 144.5 | +67.63% |
+| 4,096 | 4 | 125.0 | 159.7 | +27.76% |
+| 8,192 | 1 | 67.7 | 153.1 | +126.14% |
+| 8,192 | 2 | 62.1 | 101.6 | +63.61% |
+| 8,192 | 4 | 81.6 | 106.8 | +30.88% |
+| 16,384 | 1 | 71.1 | 136.5 | +91.98% |
+| 16,384 | 2 | 41.1 | 55.4 | +34.79% |
+| 16,384 | 4 | 45.3 | 62.4 | +37.75% |
+| 32,768 | 1 | 43.9 | 131.6 | +199.77% |
+| 32,768 | 2 | 20.2 | 28.2 | +39.60% |
+| 32,768 | 4 | 22.3 | 29.7 | +33.18% |
+| 65,536 | 1 | 29.0 | 119.0 | +310.34% |
+| 65,536 | 2 | 9.4 | 12.5 | +32.98% |
+| 65,536 | 4 | 9.3 | 12.3 | +32.26% |
+
 The release includes client-side scripts for measuring serving throughput and
 tool-call quality against a running OpenAI-compatible endpoint. See
 [`benchmarks/README.md`](benchmarks/README.md) for the pinned benchmark client,
